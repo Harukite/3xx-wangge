@@ -1,0 +1,33 @@
+# 构建上下文排除：减小镜像、避免把密钥/本地状态打进镜像
+node_modules
+npm-debug.log*
+
+# 密钥与本地配置（绝不入镜像；Dokploy 用环境变量注入）
+.env
+.env.*
+!.env.example
+
+# 运行时状态与数据库（用持久卷，不入镜像）
+.state.json
+.state.json.*
+data
+*.db
+*.db-shm
+*.db-wal
+
+# 版本控制与编辑器
+.git
+.gitignore
+.vscode
+.idea
+.claude
+
+# 文档与构建文件本身
+*.md
+Dockerfile
+.dockerignore
+
+# 打包残留
+WG-ALL*
+*.zip
+*.log
