@@ -66,8 +66,14 @@ input::placeholder{color:var(--mut2)}
   <div class="hint">仅授权用户可访问。会话将在一段时间后自动过期。</div>
 </form>
 <script>
-// 已登录则直接进主页，免去重复登录
-fetch('/api/auth/me').then(r=>r.json()).then(m=>{ if(m&&m.authed) location.replace('/'); }).catch(()=>{});
+// 已登录则直接进主页，免去重复登录；未配置白名单时提示"首次登录"语义
+fetch('/api/auth/me').then(r=>r.json()).then(m=>{
+  if(m&&m.authed){ location.replace('/'); return; }
+  if(m&&m.firstLogin){
+    var sub=document.querySelector('.sub');
+    if(sub) sub.innerHTML='首次登录：本次输入的邮箱将成为<strong>唯一管理员</strong>（此后仅该邮箱可登录）';
+  }
+}).catch(()=>{});
 var f=document.getElementById('f'),err=document.getElementById('err'),btn=document.getElementById('btn');
 f.addEventListener('submit', async function(e){
   e.preventDefault();

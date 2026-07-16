@@ -89,9 +89,11 @@ export function getConfig() {
   };
 
   // ── 登录认证 ──────────────────────────────────────────────────────────────
+  const _pwRev = Number(process.env.LOGIN_PASSWORD_REV);
   const auth = {
-    email: process.env.LOGIN_EMAIL || '',                   // 白名单邮箱（唯一允许登录的账号）
+    email: process.env.LOGIN_EMAIL || '',                   // 白名单邮箱；可空=首次登录时自动捕获并持久化
     passwordHash: process.env.LOGIN_PASSWORD_HASH || '',    // scrypt:N:r:p:salt:hash（node src/auth.js hash 生成）
+    passwordRev: Number.isFinite(_pwRev) && _pwRev > 0 ? Math.floor(_pwRev) : 1, // 密码版本号；改密递增使旧会话失效
     sessionSecret: process.env.SESSION_SECRET || '',        // 签名 cookie 密钥；空则启动时随机（重启失效登录）
     ttlHours: Number(process.env.SESSION_TTL_HOURS || 720), // 会话有效期（小时），默认 30 天
     cookieSecure: (process.env.SESSION_COOKIE_SECURE || '').toLowerCase() === 'true', // HTTPS 部署时设 true

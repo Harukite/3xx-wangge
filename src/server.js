@@ -18,6 +18,7 @@ import { setupProxies, checkProxy } from './proxy.js';
 import { loadSnapshot, saveSnapshot, flushNow } from './persist.js';
 import { createAiService } from './ai/service.js';
 import { createAuth, clientIp } from './auth.js';
+import { createLimiter } from './ratelimit.js';
 import { listExchangeConfigs, getExchangeConfig, upsertExchangeConfig, deleteExchangeConfig } from './db.js';
 import { setEnvKey, removeEnvKey } from './envfile.js';
 
@@ -79,16 +80,24 @@ if (!sessionSecret) {
 const auth = createAuth({
   email: cfg.auth.email,
   passwordHash: cfg.auth.passwordHash,
+  passwordRev: cfg.auth.passwordRev,
   sessionSecret,
   ttlMs: (cfg.auth.ttlHours || 720) * 3600 * 1000,
   cookieSecure: cfg.auth.cookieSecure,
+}, {
+  // 认证状态变更（首次捕获邮箱 / 改密）落盘到 .env，使重启后仍然生效。
+  onPersist: (patch) => {
+    if (Object.prototype.hasOwnProperty.call(patch, 'email')) setEnvKey('LOGIN_EMAIL', patch.email);
+    if (Object.prototype.hasOwnProperty.call(patch, 'passwordHash')) setEnvKey('LOGIN_PASSWORD_HASH', patch.passwordHash);
+    if (Object.prototype.hasOwnProperty.call(patch, 'passwordRev')) setEnvKey('LOGIN_PASSWORD_REV', String(patch.passwordRev));
+  },
 });
 if (!auth.configured) {
   console.error('\n[启动失败] 登录系统尚未配置（这是必需的安全步骤）。\n');
   console.error('  请编辑项目根目录的 .env，补齐：');
-  console.error('    1) LOGIN_EMAIL=jaychougo@gmail.com        （白名单邮箱）');
-  console.error('    2) LOGIN_PASSWORD_HASH=scrypt:...         （运行 npm run hash 生成，把整行贴进来）');
-  console.error('    3) SESSION_SECRET=任意长随机串            （推荐，保证重启后不掉登录）\n');
+  console.error('    1) LOGIN_PASSWORD_HASH=scrypt:...         （运行 npm run hash 生成，把整行贴进来）');
+  console.error('       LOGIN_EMAIL 可留空：首次用正确密码登录的邮箱会自动成为管理员。');
+  console.error('    2) SESSION_SECRET=任意长随机串            （推荐，保证重启后不掉登录）\n');
   process.exit(1);
 }
 
@@ -179,6 +188,15 @@ function readBody(req, maxBytes = 1_000_000) {
     req.on('end', () => { if (done) return; done = true; try { resolve(b ? JSON.parse(b) : {}); } catch { resolve({}); } });
   });
 }
+
+// ── 请求限流（防 DDoS 泛洪 / 爆破 CPU 放大）─────────────────────────────────
+// 全局桶：每 IP 每分钟最多 240 个请求（公开端点也计入），超出直接 429。
+const globalLimiter = createLimiter({ windowMs: 60_000, max: 240 });
+// 登录桶：scrypt 是同步阻塞的 CPU 重计算，每 IP 每分钟最多 10 次登录尝试（含成功），
+// 防止攻击者高频打 /api/login 把事件循环耗尽；叠加 auth 的"5 次失败锁 15 分钟"。
+const loginLimiter = createLimiter({ windowMs: 60_000, max: 10 });
+// 改密桶：更严，每 IP 每分钟 5 次。
+const pwdLimiter = createLimiter({ windowMs: 60_000, max: 5 });
 
 // ── 交易所实盘凭据字段定义（设置页面"交易所配置"管理用） ───────────────────
 const EXCHANGE_FIELDS = {
@@ -341,26 +359,45 @@ const server = http.createServer(async (request, res) => {
   const p = url.pathname;
 
   try {
-    // ── 健康检查（公开，供 Dokploy/容器探活） ────────────────────────────
+    // ── 健康检查（公开，供 Dokploy/容器探活；不限流，探活频率低） ──────────
     if (p === '/api/health') return send(res, 200, { ok: true, ts: Date.now() });
+
+    // ── 全局请求限流（防 DDoS 泛洪；按客户端 IP，公开端点同样受保护） ───────
+    const ip = clientIp(request);
+    const g = globalLimiter.check(ip);
+    if (!g.allowed) {
+      res.setHeader('Retry-After', String(Math.ceil(g.retryAfterMs / 1000)));
+      return send(res, 429, { error: '请求过于频繁，请稍后再试。' });
+    }
 
     // ── 登录 / 认证（公开路由，无需登录） ────────────────────────────────
     if (p === '/api/auth/me') {
       const u = auth.verifyRequest(request);
-      return send(res, 200, u ? { authed: true, email: u.email } : { authed: false });
+      if (u) return send(res, 200, { authed: true, email: u.email });
+      // 未登录时附带"是否尚未捕获白名单邮箱"，供登录页提示首次登录语义。
+      return send(res, 200, { authed: false, firstLogin: !auth.hasWhitelist() });
     }
     if (p === '/api/login' && request.method === 'POST') {
-      const ip = clientIp(request);
+      // 登录专项限流：scrypt 同步阻塞，防 CPU 放大（无论成败，每 IP 每分钟 10 次）。
+      const rl = loginLimiter.check(ip);
+      if (!rl.allowed) {
+        res.setHeader('Retry-After', String(Math.ceil(rl.retryAfterMs / 1000)));
+        return send(res, 429, { error: `登录尝试过于频繁，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后再试。` });
+      }
       if (auth.isLocked(ip)) {
         return send(res, 429, { error: `尝试次数过多，请 ${Math.ceil(auth.lockMsLeft(ip) / 60000)} 分钟后再试。` });
       }
       const { email, password } = await readBody(request);
-      const ok = auth.checkLogin(email, password);
+      const r = auth.checkLogin(email, password);
+      const ok = !!r.ok;
       auth.recordAttempt(ip, ok);
       if (!ok) return send(res, 401, { error: '邮箱或密码错误。' });
-      const loginEmail = String(email).trim().toLowerCase();
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': auth.issueSession(loginEmail).cookieHeader });
-      res.end(JSON.stringify({ ok: true, email: loginEmail }));
+      // 首次登录（无白名单）→ 捕获该邮箱为唯一管理员并持久化。
+      const loginEmail = r.capture || String(email).trim().toLowerCase();
+      if (r.capture) auth.captureEmail(r.capture);
+      const sess = auth.issueSession(loginEmail);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': sess.cookieHeader });
+      res.end(JSON.stringify({ ok: true, email: loginEmail, firstLogin: !!r.capture }));
       return;
     }
     if (p === '/api/logout' && request.method === 'POST') {
@@ -385,6 +422,25 @@ const server = http.createServer(async (request, res) => {
       if (p.startsWith('/api/')) return send(res, 401, { error: '未登录或会话已过期。', needLogin: true });
       res.writeHead(302, { Location: '/login.html' });
       res.end();
+      return;
+    }
+
+    // ── 修改密码（需登录 + 独立限流） ────────────────────────────────────
+    if (p === '/api/auth/change-password' && request.method === 'POST') {
+      const u = auth.verifyRequest(request);
+      if (!u) return send(res, 401, { error: '未登录或会话已过期。', needLogin: true });
+      const rp = pwdLimiter.check(ip);
+      if (!rp.allowed) {
+        res.setHeader('Retry-After', String(Math.ceil(rp.retryAfterMs / 1000)));
+        return send(res, 429, { error: '操作过于频繁，请稍后再试。' });
+      }
+      const { currentPassword, newPassword } = await readBody(request);
+      const r = auth.changePassword(currentPassword, newPassword);
+      if (!r.ok) return send(res, 400, { error: r.error || '修改失败。' });
+      // 用新密码版本号重发 cookie：当前会话延续，其他设备旧会话立即失效。
+      const sess = auth.issueSession(u.email);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Set-Cookie': sess.cookieHeader });
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
 
@@ -595,6 +651,9 @@ const server = http.createServer(async (request, res) => {
     send(res, 500, { error: e.message });
   }
 });
+
+// ── Slowloris 防护：限制请求头到达时间（不影响已进入处理的 SSE 长连接） ──────
+server.headersTimeout = 20_000;
 
 server._overviewClients = new Set();
 

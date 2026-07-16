@@ -1,14 +1,17 @@
 // ─────────────────────────────────────────────────────────────
-// 登录认证模块：白名单邮箱 + scrypt 密码哈希 + HMAC 签名 cookie + 登录限流。
-// 纯 node:crypto 实现，零外部依赖。
+// 登录认证模块：scrypt 密码哈希 + HMAC 签名 cookie + 登录限流 +
+// 动态白名单邮箱（首次登录捕获）+ 改密（密码版本号使旧会话失效）。
+// 纯 node:crypto 实现，零外部依赖；落盘由调用方经 onPersist 回调负责。
 //
 // 用法（模块）：import { createAuth } from './auth.js';
 // 用法（CLI） ：node src/auth.js hash   交互式生成密码哈希，填入 .env 的 LOGIN_PASSWORD_HASH
 //
 // 安全要点：
-//   - 密码用 scrypt(N=16384,r=8,p=1) 加盐哈希存储，永不落明文；
-//   - 登录态是无状态签名 cookie（payload.HMAC），服务端不存 session 表、无需数据库；
-//   - 邮箱须严格等于白名单 LOGIN_EMAIL；登录失败按 IP 计数，5 次锁 15 分钟防爆破；
+//   - 密码用 scrypt(N=16384,r=8,p=1) 加盐哈希存储，永不落明文；改密走 changePassword；
+//   - 登录态是无状态签名 cookie（payload.HMAC），payload 内含密码版本号 v；
+//     改密后 v 递增，所有旧 cookie 即刻失效（无需服务端 session 表）；
+//   - 邮箱白名单可不预置：第一个用正确密码登录的合法邮箱被捕获为唯一白名单；
+//   - 登录失败按 IP 计数，5 次锁 15 分钟防爆破；接口级请求限流见 ratelimit.js + server.js；
 //   - cookie 默认 HttpOnly + SameSite=Strict（防 XSS 读取 / CSRF 跨站）。
 // ─────────────────────────────────────────────────────────────
 import crypto from 'node:crypto';
@@ -19,6 +22,8 @@ const SCRYPT_N = 16384, SCRYPT_R = 8, SCRYPT_P = 1, SCRYPT_KEYLEN = 32;
 const DEFAULT_TTL_MS = 30 * 24 * 3600 * 1000; // 30 天
 const MAX_FAILS = 5;
 const LOCK_MS = 15 * 60 * 1000;
+// 占位哈希：passwordHash 缺失时也对输入跑一次 scrypt，消除"邮箱/密码是否存在"的时序侧信道。
+const PLACEHOLDER_HASH = 'scrypt:16384:8:1:00000000000000000000000000000000:00000000000000000000000000000000';
 
 const b64u = (buf) => Buffer.from(buf).toString('base64url');
 const b64uDec = (s) => Buffer.from(s, 'base64url');
@@ -50,16 +55,16 @@ export function verifyPassword(plain, stored) {
   return crypto.timingSafeEqual(got, want);
 }
 
-/** 生成签名 session token：base64url(payload).base64url(hmac)。 */
-export function createSession(email, secret, ttlMs = DEFAULT_TTL_MS) {
+/** 生成签名 session token：base64url(payload).base64url(hmac)。payload 含密码版本号 v。 */
+export function createSession(email, secret, ttlMs = DEFAULT_TTL_MS, pwVer = 1) {
   const key = sessionKey(secret);
-  const payload = { e: email, exp: Date.now() + ttlMs };
+  const payload = { e: email, v: pwVer, exp: Date.now() + ttlMs };
   const body = b64u(JSON.stringify(payload));
   const sig = crypto.createHmac('sha256', key).update(body).digest('base64url');
   return { token: `${body}.${sig}`, exp: payload.exp, ttlMs };
 }
 
-/** 校验 token，成功返回 {email, exp}，失败返回 null。 */
+/** 校验 token，成功返回 {email, v, exp}，失败返回 null。v 为密码版本号（旧 token 缺省为 1）。 */
 export function verifySession(token, secret) {
   if (typeof token !== 'string' || !token.includes('.')) return null;
   const [body, sig] = token.split('.');
@@ -70,7 +75,7 @@ export function verifySession(token, secret) {
   try { payload = JSON.parse(b64uDec(body).toString('utf8')); } catch { return null; }
   if (!payload || typeof payload.e !== 'string' || typeof payload.exp !== 'number') return null;
   if (payload.exp < Date.now()) return null; // 过期
-  return { email: payload.e, exp: payload.exp };
+  return { email: payload.e, v: typeof payload.v === 'number' ? payload.v : 1, exp: payload.exp };
 }
 
 /** SESSION_SECRET 为空时用进程内随机密钥兜底（仅防 cookie 被篡改；重启即失效）。 */
@@ -85,6 +90,11 @@ function safeEqual(a, b) {
 function safeEqualStr(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return a === b;
   return safeEqual(a, b);
+}
+
+/** 简易邮箱格式校验（用于"首次登录捕获"时拒绝明显非法输入）。 */
+function isValidEmail(e) {
+  return typeof e === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && e.length <= 254;
 }
 
 /** 从请求头解析 cookie 为对象。 */
@@ -111,25 +121,66 @@ export function clientIp(req) {
 }
 
 /**
- * 构造一个认证器实例（持有白名单、密钥、内存限流表）。
- * @param {{email:string, passwordHash:string, sessionSecret:string, ttlMs?:number, cookieSecure?:boolean}} cfg
+ * 构造一个认证器实例（持有白名单邮箱、密码哈希、密码版本号、密钥、内存限流表）。
+ *
+ * 邮箱白名单支持"首次登录捕获"：初始未给 email 时，第一个用正确密码登录的
+ * 合法邮箱经 captureEmail 记下并由 onPersist 持久化，此后仅该邮箱可登录。
+ *
+ * 密码版本号 pwVer 写入 session；改密后递增，旧版本 cookie 校验失败，即改密后
+ * 所有既有会话立即失效（改密当次由调用方用新版本重发 cookie）。
+ *
+ * @param {{email?:string, passwordHash:string, passwordRev?:number, sessionSecret:string, ttlMs?:number, cookieSecure?:boolean}} cfg
+ * @param {{onPersist?:(patch:{email?:string, passwordHash?:string, passwordRev?:number}) => void}} [hooks]
  */
-export function createAuth(cfg = {}) {
-  const email = String(cfg.email || '').trim().toLowerCase();
-  const passwordHash = cfg.passwordHash || '';
+export function createAuth(cfg = {}, hooks = {}) {
+  let email = String(cfg.email || '').trim().toLowerCase();
+  let passwordHash = cfg.passwordHash || '';
+  let pwRev = Number.isFinite(cfg.passwordRev) && cfg.passwordRev > 0 ? Math.floor(cfg.passwordRev) : 1;
   const secret = cfg.sessionSecret || '';
   const ttlMs = cfg.ttlMs || DEFAULT_TTL_MS;
   const cookieSecure = !!cfg.cookieSecure;
+  const onPersist = typeof hooks?.onPersist === 'function' ? hooks.onPersist : null;
   const attempts = new Map(); // ip -> {fails, lockUntil, last}
 
-  /** 校验登录凭据；白名单 + 密码双重校验。无论邮箱对错都跑一次 scrypt，拉平耗时。 */
+  /** 把首次登录的邮箱记为白名单，并经 onPersist 持久化。 */
+  function captureEmail(e) {
+    email = String(e || '').trim().toLowerCase();
+    if (onPersist) onPersist({ email });
+  }
+
+  /**
+   * 校验登录凭据，返回 {ok, capture?}：
+   *   - 密码错误 → {ok:false}（仍跑完 scrypt，避免时序侧信道）；
+   *   - 已有白名单 → 邮箱须精确匹配；
+   *   - 无白名单（首次）→ 任意合法邮箱 + 正确密码 → {ok:true, capture:邮箱}。
+   */
   function checkLogin(emailIn, pw) {
     const e = String(emailIn || '').trim().toLowerCase();
-    const emailOk = safeEqualStr(e, email);
-    // 邮箱不符时也对一个占位哈希做一次校验，避免"邮箱是否存在"的时序侧信道
-    const stored = passwordHash || 'scrypt:16384:8:1:00000000000000000000000000000000:00000000000000000000000000000000';
+    // 始终对占位哈希跑一次 scrypt，拉平"邮箱/密码是否存在"的时序。
+    const stored = passwordHash || PLACEHOLDER_HASH;
     const pwOk = verifyPassword(String(pw || ''), stored);
-    return emailOk && pwOk;
+    if (!pwOk) return { ok: false };
+    if (email) return { ok: safeEqualStr(e, email) };
+    if (isValidEmail(e)) return { ok: true, capture: e };
+    return { ok: false };
+  }
+
+  /**
+   * 修改密码：校验旧密码 → 强度校验 → 新 scrypt 哈希 → 版本号递增 → onPersist 持久化。
+   * 成功返回 {ok, passwordRev}；失败返回 {ok:false, error}。成功后既有会话因版本号过期。
+   */
+  function changePassword(currentPlain, nextPlain) {
+    const cur = String(currentPlain || '');
+    const next = String(nextPlain || '');
+    if (!passwordHash) return { ok: false, error: '尚未设置登录密码' };
+    if (!verifyPassword(cur, passwordHash)) return { ok: false, error: '当前密码错误' };
+    if (next.length < 8) return { ok: false, error: '新密码至少 8 位' };
+    if (next === cur) return { ok: false, error: '新密码不能与旧密码相同' };
+    const newHash = hashPassword(next);
+    passwordHash = newHash;
+    pwRev += 1;
+    if (onPersist) onPersist({ passwordHash: newHash, passwordRev: pwRev });
+    return { ok: true, passwordRev: pwRev };
   }
 
   function isLocked(ip) {
@@ -160,10 +211,10 @@ export function createAuth(cfg = {}) {
     if (cookieSecure) segs.push('Secure');
     return segs.join('; ');
   }
-  /** 颁发登录态：返回 token 及完整 Set-Cookie 头值。 */
+  /** 颁发登录态：用当前密码版本号签名，返回 token 及完整 Set-Cookie 头值。 */
   function issueSession(userEmail) {
-    const { token, exp } = createSession(userEmail, secret, ttlMs);
-    return { token, exp, cookieHeader: toCookieHeader(token, ttlMs) };
+    const { token, exp } = createSession(userEmail, secret, ttlMs, pwRev);
+    return { token, exp, cookieHeader: toCookieHeader(token, ttlMs), passwordRev: pwRev };
   }
   function clearCookieHeader() {
     const segs = [`${COOKIE_NAME}=`, 'HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=0'];
@@ -171,21 +222,27 @@ export function createAuth(cfg = {}) {
     return segs.join('; ');
   }
 
-  /** 校验请求是否已登录，返回 {email} 或 null。 */
+  /** 校验请求是否已登录（含密码版本号校验），返回 {email} 或 null。 */
   function verifyRequest(req) {
     const tok = parseCookies(req)[COOKIE_NAME];
     if (!tok) return null;
     const r = verifySession(tok, secret);
-    return r ? { email: r.email } : null;
+    if (!r) return null;
+    if (r.v !== pwRev) return null; // 密码已改（版本号不匹配）→ 视同过期
+    return { email: r.email };
   }
 
   return {
     COOKIE_NAME,
-    whitelistEmail: email,
+    get whitelistEmail() { return email; },
+    hasWhitelist: () => !!email,
+    captureEmail,
     checkLogin, isLocked, lockMsLeft, recordAttempt,
     issueSession, clearCookieHeader, verifyRequest,
-    /** 配置是否就绪（缺邮箱或缺哈希都视为未配置，服务应拒绝启动）。 */
-    configured: !!(email && passwordHash),
+    changePassword,
+    get passwordRev() { return pwRev; },
+    /** 配置是否就绪：有密码哈希即可启动（邮箱可空=首次登录时捕获）。 */
+    get configured() { return !!passwordHash; },
   };
 }
 
@@ -234,7 +291,7 @@ async function runHashCli() {
   const h = hashPassword(pw1);
   console.log('\n✓ 已生成。请把下面这一整行填入项目根目录的 .env（设置 LOGIN_PASSWORD_HASH）：\n');
   console.log(`LOGIN_PASSWORD_HASH=${h}`);
-  console.log('\n白名单邮箱填 LOGIN_EMAIL（例如 LOGIN_EMAIL=jaychougo@gmail.com）。');
+  console.log('\n白名单邮箱 LOGIN_EMAIL 可留空：首次用正确密码登录的邮箱会自动成为管理员。');
   console.log('（可选但推荐）设一个固定的 SESSION_SECRET 随机串，保证重启后登录态不失效。');
   process.exit(0);
 }

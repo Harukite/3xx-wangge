@@ -348,6 +348,7 @@ th { color: var(--mut2); font-weight: 600; font-size: 10px; text-transform: uppe
     <span id="hdr-conn" class="conn warn" title="后端连接状态"><span class="cdot"></span><span id="hdr-conn-txt">连接中…</span></span>
     <span class="muted" id="hdr-time"></span>
     <span class="muted hdr-user" id="hdr-user" title="当前登录用户"></span>
+    <button class="hd-logout" onclick="openChangePwd()" title="修改登录密码" style="margin-right:8px">改密</button>
     <button class="hd-logout" onclick="logout()" title="退出登录">退出</button>
   </div>
 </div>
@@ -1087,6 +1088,53 @@ async function logout() {
   if (!confirm('确定退出登录？')) return;
   try { await fetch('/api/logout', { method: 'POST', _auth: true }); } catch (e) {}
   location.replace('/login.html');
+}
+// ── 修改登录密码（动态弹窗，调 /api/auth/change-password） ──────────────────
+function openChangePwd() {
+  if (document.getElementById('pwd-modal')) return;
+  var ov = document.createElement('div');
+  ov.id = 'pwd-modal';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:9999;padding:16px';
+  var lab = 'display:block;font-size:12px;color:var(--mut,#8fa5c0);margin:10px 0 4px';
+  var inp = 'width:100%;padding:11px 12px;background:var(--bg2,#0a0e17);border:1px solid var(--border2,#253350);border-radius:8px;color:var(--txt,#dde6f0);font-size:15px;box-sizing:border-box';
+  ov.innerHTML =
+    '<div style="width:100%;max-width:340px;background:var(--panel,#141924);border:1px solid var(--border,#1e2d45);border-radius:14px;padding:24px 20px">' +
+    '<div style="font-size:17px;font-weight:700;margin-bottom:6px">修改登录密码</div>' +
+    '<div style="color:var(--mut,#8fa5c0);font-size:12px;margin-bottom:6px">改密后其他设备的登录会立即失效。</div>' +
+    '<label style="' + lab + '">当前密码</label>' +
+    '<input id="pwd-cur" type="password" autocomplete="current-password" style="' + inp + '">' +
+    '<label style="' + lab + '">新密码（至少 8 位）</label>' +
+    '<input id="pwd-new" type="password" autocomplete="new-password" style="' + inp + '">' +
+    '<label style="' + lab + '">确认新密码</label>' +
+    '<input id="pwd-new2" type="password" autocomplete="new-password" style="' + inp + '">' +
+    '<div id="pwd-err" style="color:var(--red,#ef4444);font-size:13px;min-height:18px;margin-top:12px"></div>' +
+    '<div style="display:flex;gap:10px;margin-top:8px">' +
+    '<button id="pwd-cancel" style="flex:1;padding:11px;border:1px solid var(--border2,#253350);border-radius:8px;background:transparent;color:var(--mut,#8fa5c0);cursor:pointer;font-size:14px">取消</button>' +
+    '<button id="pwd-ok" style="flex:1;padding:11px;border:none;border-radius:8px;background:linear-gradient(135deg,var(--pur,#8b5cf6),var(--pur2,#7c3aed));color:#fff;cursor:pointer;font-size:14px;font-weight:600">确认修改</button>' +
+    '</div></div>';
+  document.body.appendChild(ov);
+  function close() { ov.remove(); }
+  ov.addEventListener('click', function (e) { if (e.target === ov) close(); });
+  document.getElementById('pwd-cancel').onclick = close;
+  document.getElementById('pwd-ok').onclick = async function () {
+    var cur = document.getElementById('pwd-cur').value;
+    var nw = document.getElementById('pwd-new').value;
+    var nw2 = document.getElementById('pwd-new2').value;
+    var err = document.getElementById('pwd-err');
+    err.textContent = '';
+    if (!cur || !nw || !nw2) { err.textContent = '请填写所有字段。'; return; }
+    if (nw.length < 8) { err.textContent = '新密码至少 8 位。'; return; }
+    if (nw !== nw2) { err.textContent = '两次新密码不一致。'; return; }
+    var btn = this; btn.disabled = true; btn.textContent = '提交中…';
+    try {
+      var r = await fetch('/api/auth/change-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ currentPassword: cur, newPassword: nw }) });
+      var j = await r.json().catch(function () { return {}; });
+      if (r.ok && j.ok) { close(); alert('密码已修改，其他设备的登录已失效。'); }
+      else err.textContent = j.error || ('修改失败（' + r.status + '）');
+    } catch (ex) { err.textContent = '网络错误，请重试。'; }
+    btn.disabled = false; btn.textContent = '确认修改';
+  };
+  document.getElementById('pwd-cur').focus();
 }
 
 // ── 工具函数 ────────────────────────────────────────────────────────────────
