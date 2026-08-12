@@ -5,6 +5,7 @@
 // simulated (matched against the real price path). If no endpoint is
 // reachable, it falls back to a synthetic random walk and labels itself so.
 import { EventEmitter } from 'node:events';
+import { remapPaperMarket, replacePaperMarkets, restorePaperState, snapshotPaperState, stableMarketName } from '../paper-state.js';
 
 const FALLBACK_MARKETS = [
   { marketId: 1, displayName: 'BTC-PERP', symbol: 'BTC', lastPrice: 61000, stepSize: 0.001, stepPrice: 0.1, maxLeverage: 50, minOrderSize: 0.001 },
@@ -18,8 +19,8 @@ export class PaperExchange extends EventEmitter {
     this.balance = opts.startBalance ?? 10000;
     // Candidate REST bases: explicit override -> mainnet -> testnet.
     this.candidates = [...new Set((opts.apiUrl ? [opts.apiUrl] : []).concat([
-      'https://api.risex.trade',       // mainnet (real prices)
-      'https://api.rise.trade',        // alt mainnet host
+      'https://api.rise.trade',        // mainnet (real prices; preferred — risex.trade often ENOTFOUND)
+      'https://api.risex.trade',       // alt mainnet host
       'https://api.testnet.rise.trade',// testnet fallback
     ]))];
     this.apiUrl = this.candidates[0];
@@ -53,6 +54,7 @@ export class PaperExchange extends EventEmitter {
       this.dataSource = 'real';
       this.network = chosen.includes('testnet') ? 'testnet' : 'mainnet';
     } else {
+      console.log('[模拟模式] RISEx 行情接口不可达，使用合成行情。可设 RISEX_API_URL=https://api.rise.trade 或配置代理后重连。');
       this.dataSource = 'synthetic';
       this._setMarkets(FALLBACK_MARKETS.map((m) => ({ ...m })));
     }
@@ -73,9 +75,11 @@ export class PaperExchange extends EventEmitter {
           this.apiUrl = url;
           this.network = url.includes('testnet') ? 'testnet' : 'mainnet';
           if (this.dataSource !== 'real') { // upgrade only: never re-number live market ids
-            this.dataSource = 'real';
             this._setMarkets(list);
-            for (const [id, m] of this.markets) { this.prices.set(id, m.lastPrice || 100); this.realTarget.set(id, m.lastPrice || 100); }
+            this.dataSource = 'real';
+            // synthetic 启动时不会开 poll 定时器；升到 real 后必须清掉再走 _startLoops
+            if (this._pollTimer) { clearInterval(this._pollTimer); this._pollTimer = null; }
+            console.log(`[RISEx paper] 已切到真实行情: ${url}（${list.length} 个市场）`);
           }
           break;
         }
@@ -87,27 +91,41 @@ export class PaperExchange extends EventEmitter {
   }
 
   async _fetchMarkets(url) {
-    try {
-      const res = await fetch(`${url}/v1/markets`, { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) return null;
-      const j = await res.json();
-      const out = [];
-      for (const m of j.markets || []) {
-        const cfg = m.config || {};
-        const price = Number(m.mark_price || m.last_price || 0);
-        if (!price) continue;
-        out.push({
-          marketId: Number(m.market_id), displayName: m.display_name || cfg.name,
-          symbol: m.base_asset_symbol, lastPrice: price,
-          stepSize: Number(cfg.step_size || 0.001), stepPrice: Number(cfg.step_price || 0.1),
-          maxLeverage: Number(cfg.max_leverage || 20), minOrderSize: Number(cfg.min_order_size || cfg.step_size || 0.001),
-        });
+    // Retry once: cold-start DNS / brief network blips often fail the first probe.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const res = await fetch(`${url}/v1/markets`, { signal: AbortSignal.timeout(10000) });
+        if (!res.ok) {
+          if (attempt === 2) console.log(`[RISEx paper] ${url} → HTTP ${res.status}`);
+          continue;
+        }
+        const j = await res.json();
+        const out = [];
+        // RISEx wraps as {data:{markets}}; stay tolerant of a flat {markets}
+        const list = j.data?.markets ?? j.markets;
+        for (const m of list || []) {
+          const cfg = m.config || {};
+          const price = Number(m.mark_price || m.last_price || 0);
+          if (!price) continue;
+          out.push({
+            marketId: Number(m.market_id), displayName: m.display_name || cfg.name,
+            symbol: m.base_asset_symbol, lastPrice: price,
+            stepSize: Number(cfg.step_size || 0.001), stepPrice: Number(cfg.step_price || 0.1),
+            maxLeverage: Number(cfg.max_leverage || 20), minOrderSize: Number(cfg.min_order_size || cfg.step_size || 0.001),
+          });
+        }
+        if (out.length) return out;
+        if (attempt === 2) console.log(`[RISEx paper] ${url} → 响应无有效市场`);
+      } catch (e) {
+        const why = e?.cause?.code || e?.message || e;
+        if (attempt === 2) console.log(`[RISEx paper] ${url} → ${why}`);
+        else await new Promise((r) => setTimeout(r, 400));
       }
-      return out.length ? out : null;
-    } catch { return null; }
+    }
+    return null;
   }
 
-  _setMarkets(list) { this.markets.clear(); for (const m of list) this.markets.set(m.marketId, m); }
+  _setMarkets(list) { replacePaperMarkets(this, list); }
 
   async getMarkets() { return [...this.markets.values()]; }
 
@@ -143,11 +161,29 @@ export class PaperExchange extends EventEmitter {
   async fetchOpenOrders(marketId) {
     return [...this.orders.values()]
       .filter((o) => Number(o.marketId) === Number(marketId))
-      .map((o) => ({ orderId: String(o.orderId), price: Number(o.price), side: o.side }));
+      .map((o) => ({
+        orderId: String(o.orderId), price: Number(o.price), side: o.side,
+        sizeBase: Number(o.sizeBase), reduceOnly: !!o.reduceOnly, metadataComplete: true,
+      }));
   }
 
-  adoptOrder({ orderId, marketId, levelIndex, side, price, sizeBase }) {
-    this.orders.set(String(orderId), { orderId: String(orderId), marketId: Number(marketId), levelIndex, side, price: Number(price), sizeBase: Number(sizeBase), reduceOnly: false });
+  adoptOrder({ orderId, marketId, levelIndex, side, price, sizeBase, reduceOnly = false }) {
+    const id = String(orderId);
+    this.orders.set(id, { orderId: id, marketId: Number(marketId), levelIndex, side, price: Number(price), sizeBase: Number(sizeBase), reduceOnly: !!reduceOnly });
+    const seq = Number(id.match(/^paper-(\d+)$/)?.[1]);
+    if (Number.isInteger(seq)) this._seq = Math.max(this._seq, seq + 1);
+  }
+
+  snapshotState() {
+    return snapshotPaperState(this);
+  }
+
+  restoreState(state) {
+    restorePaperState(this, state);
+  }
+
+  remapMarketId(from, to) {
+    remapPaperMarket(this, from, to);
   }
 
   getPosition(marketId) {
@@ -156,6 +192,8 @@ export class PaperExchange extends EventEmitter {
     const last = this.prices.get(marketId);
     return { sizeBase: p.sizeBase, entryPrice: p.entryPrice, unrealizedPnl: p.sizeBase * (last - p.entryPrice) };
   }
+
+  async refreshPosition(marketId) { return this.getPosition(marketId); }
 
   async closePosition(marketId) {
     const id = Number(marketId);
@@ -181,7 +219,8 @@ export class PaperExchange extends EventEmitter {
       const res = await fetch(`${this.apiUrl}/v1/markets?force_refresh=true`, { signal: AbortSignal.timeout(6000) });
       if (!res.ok) return;
       const j = await res.json();
-      for (const m of j.markets || []) {
+      const list = j.data?.markets ?? j.markets;
+      for (const m of list || []) {
         const id = Number(m.market_id);
         const price = Number(m.mark_price || m.last_price || 0);
         if (price && this.realTarget.has(id)) this.realTarget.set(id, price);
@@ -217,9 +256,13 @@ export class PaperExchange extends EventEmitter {
       const crossedSell = o.side === 'sell' && cur >= o.price;
       if (!crossedBuy && !crossedSell) continue;
       if (o.reduceOnly && !this._reduces(marketId, o.side)) { this.orders.delete(o.orderId); continue; }
+      const fillSize = o.reduceOnly
+        ? Math.min(o.sizeBase, Math.abs(this.positions.get(marketId)?.sizeBase || 0))
+        : o.sizeBase;
       this.orders.delete(o.orderId);
-      this._applyFill(marketId, o.side, o.price, o.sizeBase);
-      this.emit('fill', { orderId: o.orderId, marketId, side: o.side, price: o.price, sizeBase: o.sizeBase, levelIndex: o.levelIndex, clientOrderId: o.clientOrderId });
+      if (!(fillSize > 0)) continue;
+      this._applyFill(marketId, o.side, o.price, fillSize);
+      this.emit('fill', { orderId: o.orderId, marketId, side: o.side, price: o.price, sizeBase: fillSize, levelIndex: o.levelIndex, clientOrderId: o.clientOrderId });
     }
   }
 
@@ -235,7 +278,7 @@ export class PaperExchange extends EventEmitter {
     const fee = price * qty * this.feeRate;
     this.balance -= fee;
     this.realizedPnl -= fee;
-    const p = this.positions.get(marketId) || { sizeBase: 0, entryPrice: 0 };
+    const p = this.positions.get(marketId) || { sizeBase: 0, entryPrice: 0, marketName: stableMarketName(this.markets.get(Number(marketId))) };
     const signed = side === 'buy' ? qty : -qty;
     if (p.sizeBase === 0 || Math.sign(p.sizeBase) === Math.sign(signed)) {
       const newSize = p.sizeBase + signed;

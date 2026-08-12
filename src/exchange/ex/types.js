@@ -11,6 +11,7 @@
 //   async cancelAll(marketId)
 //   getOpenOrders(marketId)                    -> Order[]
 //   getPosition(marketId)                      -> Position | null
+//   async refreshPosition(marketId)             -> Position | null
 //   start() / stop()
 //   events: 'price' ({marketId, price}), 'fill' (Fill), 'error' (Error)
 //

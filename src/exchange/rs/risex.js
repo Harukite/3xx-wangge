@@ -140,7 +140,8 @@ export class RisexExchange extends EventEmitter {
       const bid = Number(book.bids?.[0]?.[0] ?? book.bids?.[0]?.price);
       const ask = Number(book.asks?.[0]?.[0] ?? book.asks?.[0]?.price);
       if (bid && ask) { const mid = (bid + ask) / 2; this._prices.set(Number(marketId), mid); return mid; }
-    } catch { /* fall back to mark */ }
+    } catch { /* fall back only when a fresh quote was not required */ }
+    if (opts.requireFresh) return null;
     return this._prices.get(Number(marketId)) ?? this.markets.get(Number(marketId))?.lastPrice;
   }
 
@@ -154,6 +155,8 @@ export class RisexExchange extends EventEmitter {
 
   async placeLimitOrder(o) {
     const mId = Number(o.marketId);
+    const priceUsed = this._ticks(mId, o.price) * this.markets.get(mId).stepPrice;
+    const sizeUsed = this._steps(mId, o.sizeBase) * this.markets.get(mId).stepSize;
     const r = await this._serial(() => this._client.placeOrder({
       market_id: mId,
       side: o.side === 'buy' ? 0 : 1,
@@ -174,20 +177,29 @@ export class RisexExchange extends EventEmitter {
     const orderId = r.order_id || r.orderId;
     if (orderId) {
       this._watch.add(mId);
-      this._tracked.set(String(orderId), { marketId: mId, levelIndex: o.levelIndex, side: o.side, price: o.price, sizeBase: o.sizeBase, seen: false, placedAt: Date.now() });
+      this._tracked.set(String(orderId), {
+        marketId: mId, levelIndex: o.levelIndex, side: o.side,
+        price: priceUsed, sizeBase: sizeUsed, reduceOnly: !!o.reduceOnly,
+        seen: false, placedAt: Date.now(),
+      });
     }
-    return { orderId };
+    return { orderId, priceUsed, sizeUsed };
   }
 
   async cancelOrder(marketId, orderId) {
+    const result = await this._serial(() => this._client.cancelOrder({ market_id: Number(marketId), order_id: String(orderId) }));
+    if (result?.success !== true) return false;
     this._tracked.delete(String(orderId));
-    return this._serial(() => this._client.cancelOrder({ market_id: Number(marketId), order_id: String(orderId) }));
+    return true;
   }
 
   async cancelAll(marketId) {
-    // clear tracking first so the poll loop doesn't mistake cancels for fills
-    for (const [id, o] of this._tracked) if (o.marketId === Number(marketId)) this._tracked.delete(id);
-    try { return await this._serial(() => this._client.cancelAllOrders(Number(marketId))); }
+    try {
+      const result = await this._serial(() => this._client.cancelAllOrders(Number(marketId)));
+      if (result?.success !== true) return false;
+      for (const [id, o] of this._tracked) if (o.marketId === Number(marketId)) this._tracked.delete(id);
+      return true;
+    }
     catch (e) { this.emit('error', e); return false; }
   }
 
@@ -198,22 +210,40 @@ export class RisexExchange extends EventEmitter {
   /** REAL resting orders on the exchange for this market (for reconciliation). */
   async fetchOpenOrders(marketId) {
     const mId = Number(marketId);
+    const market = this.markets.get(mId);
     const open = await this._info.getOpenOrders(this.account, mId);
-    return (Array.isArray(open) ? open : []).map((o) => {
-      const px = Number(o.price ?? (o.price_ticks != null ? o.price_ticks * this.markets.get(mId)?.stepPrice : 0));
-      const side = (typeof o.side === 'number') ? (o.side === 0 ? 'buy' : 'sell')
-        : (/^(0|buy|long)$/i.test(String(o.side)) ? 'buy' : 'sell');
-      return { orderId: String(o.order_id), price: px, side };
+    if (!Array.isArray(open)) return null;
+    return open.map((o) => {
+      const side = (typeof o.side === 'number')
+        ? (o.side === 0 ? 'buy' : (o.side === 1 ? 'sell' : null))
+        : (/^(0|buy|long)$/i.test(String(o.side)) ? 'buy'
+          : (/^(1|sell|short)$/i.test(String(o.side)) ? 'sell' : null));
+      const reduceOnly = typeof o.reduce_only === 'boolean' ? o.reduce_only : null;
+      const ticks = Number(o.price_ticks);
+      const steps = Number(o.size_steps);
+      const price = Number.isFinite(ticks) && Number.isFinite(market?.stepPrice) && market.stepPrice > 0
+        ? ticks * market.stepPrice : null;
+      // The SDK's open-order shape exposes total encoded size_steps but not a
+      // documented remaining quantity. A partially filled OPEN order therefore
+      // cannot be proven equal to the persisted remainder from this endpoint.
+      const sizeBase = null;
+      const metadataComplete = !!o.order_id && ['buy', 'sell'].includes(side)
+        && Number.isFinite(price) && price > 0 && Number.isFinite(sizeBase) && sizeBase > 0
+        && typeof reduceOnly === 'boolean';
+      return {
+        orderId: String(o.order_id), price, side, sizeBase,
+        reduceOnly, metadataComplete,
+      };
     });
   }
 
   /** Re-attach a previously-placed order to this adapter's tracking (resume). */
-  adoptOrder({ orderId, marketId, levelIndex, side, price, sizeBase }) {
+  adoptOrder({ orderId, marketId, levelIndex, side, price, sizeBase, reduceOnly = false }) {
     const mId = Number(marketId);
     this._watch.add(mId);
     this._tracked.set(String(orderId), {
       marketId: mId, levelIndex, side, price: Number(price), sizeBase: Number(sizeBase),
-      seen: false, placedAt: Date.now(),
+      reduceOnly: !!reduceOnly, seen: false, placedAt: Date.now(),
     });
   }
 
@@ -222,7 +252,55 @@ export class RisexExchange extends EventEmitter {
     return p && p.sizeBase !== 0 ? p : null;
   }
 
-  async closePosition(marketId) { return this._client.closePosition(Number(marketId)); }
+  async refreshPosition(marketId) {
+    const mId = Number(marketId);
+    const p = await this._info.getPosition(mId, this.account);
+    if (!p || !Number(p.size)) {
+      this._pos.delete(mId);
+      return null;
+    }
+    const short = (typeof p.side === 'number') ? p.side === 1 : /^(1|short|sell)$/i.test(String(p.side));
+    const size = Math.abs(Number(p.size)) * (short ? -1 : 1);
+    const num = (value) => (value != null && value !== '' && Number.isFinite(Number(value))) ? Number(value) : NaN;
+    let entry = num(p.avg_entry_price) || num(p.entry_price) || num(p.average_entry_price);
+    if (!(entry > 0)) {
+      const quote = num(p.quote_amount);
+      if (Number.isFinite(quote) && Math.abs(size) > 0) entry = Math.abs(quote) / Math.abs(size);
+    }
+    entry = entry > 0 ? entry : 0;
+    const mark = num(p.mark_price) || this._prices.get(mId) || entry;
+    let unrealizedPnl = num(p.unrealized_pnl);
+    if (!Number.isFinite(unrealizedPnl)) unrealizedPnl = entry > 0 && mark > 0 ? size * (mark - entry) : 0;
+    const position = { sizeBase: size, entryPrice: entry, unrealizedPnl, leverage: num(p.leverage) || null };
+    this._pos.set(mId, position);
+    return position;
+  }
+
+  async closePosition(marketId) {
+    const mId = Number(marketId);
+    const p = await this._info.getPosition(mId, this.account);
+    if (!p) return true;
+    const size = Number(p.size);
+    if (p.size == null || p.size === '' || !Number.isFinite(size)) throw new Error('RISEx 持仓数量无效，拒绝提交平仓单。');
+    if (size === 0) return true;
+    const side = String(p.side).toLowerCase();
+    if (!['0', '1', 'long', 'short', 'buy', 'sell'].includes(side)) {
+      throw new Error('RISEx 持仓方向无效，拒绝提交平仓单。');
+    }
+    const short = /^(1|short|sell)$/.test(side);
+    return this._serial(() => this._client.placeOrder({
+      market_id: mId,
+      side: short ? 0 : 1,
+      order_type: 0,           // Market
+      price_ticks: 0,
+      size_steps: this._steps(mId, Math.abs(size)),
+      time_in_force: 3,        // IOC
+      post_only: false,
+      reduce_only: true,
+      stp_mode: 0,
+      ttl_units: 0,
+    }));
+  }
 
   start() { if (!this._timer) { this._timer = setInterval(() => this._poll(), this.pollMs); this._timer.unref?.(); } }
   stop() { if (this._timer) { clearInterval(this._timer); this._timer = null; } }
@@ -268,29 +346,9 @@ export class RisexExchange extends EventEmitter {
           for (const [id, t] of [...this._tracked]) {
             if (t.marketId !== mId || liveIds.has(id)) continue;
             if (!t.seen && now - (t.placedAt || 0) < this._graceMs) continue;
-            // NOTE: the risex-client SDK exposes NO order-status/fill endpoint, so
-            // a fill cannot be POSITIVELY confirmed. To avoid fabricating fills
-            // from a transient data lag (which would spawn runaway same-side
-            // orders), require the order to be ABSENT for several consecutive
-            // polls before concluding it filled. (If a confirmation endpoint
-            // becomes available, switch to filledQty-based confirmation.)
-            t.goneAttempts = (t.goneAttempts || 0) + 1;
-            if (t.goneAttempts < 3) continue;
-            this._tracked.delete(id);
-            // Corroborate with the observed price path: a limit BUY can only fill
-            // if the market came DOWN to its price (sell: up to it). If price
-            // never got within 0.3% of the limit while we watched, the vanished
-            // order can't have filled — it was cancelled (manual cancel on the
-            // website, rejection, ...). Emitting a phantom fill here used to
-            // corrupt stats and spawn a bogus opposite-side replacement.
-            const neverReached = t.side === 'buy'
-              ? (t.pxLo != null && t.pxLo > t.price * 1.003)
-              : (t.pxHi != null && t.pxHi < t.price * 0.997);
-            if (neverReached) {
-              this.emit('error', new Error(`订单 ${id}（${t.side} @ ${t.price}）从盘口消失但价格从未触及该档位，判定为被撤单（不视为成交、不补单）。`));
-              continue;
-            }
-            this.emit('fill', { orderId: id, marketId: mId, side: t.side, price: t.price, sizeBase: t.sizeBase, levelIndex: t.levelIndex });
+            if (t.resolving) continue;
+            t.resolving = true;
+            this._resolveGone(id, t).finally(() => { t.resolving = false; });
           }
         }
         // position
@@ -322,6 +380,68 @@ export class RisexExchange extends EventEmitter {
       this.lastOkAt = Date.now();
     } catch (e) { this.lastError = e?.message || String(e); this.emit('error', e); }
     finally { this._busy = false; }
+  }
+
+  async _resolveGone(id, t) {
+    let verdict = 'unknown';
+    let fillPrice = t.price, fillSize = t.sizeBase;
+    let matches = [], order = null;
+    let historyExhaustive = true;
+    try {
+      const fills = await this._info.getAccountTradeHistory(this.account, t.marketId, 200);
+      if (!Array.isArray(fills)) historyExhaustive = false;
+      const rows = Array.isArray(fills) ? fills : [];
+      matches = rows.filter((row) => String(row.order_id) === String(id));
+      if (!matches.length && rows.length >= 200) historyExhaustive = false;
+    } catch { historyExhaustive = false; }
+    try {
+      const history = await this._info.getOrderHistory(this.account, t.marketId, 200);
+      if (!Array.isArray(history)) historyExhaustive = false;
+      const rows = Array.isArray(history) ? history : [];
+      order = rows.find((row) => String(row.order_id) === String(id)) || null;
+      if (!order && rows.length >= 200) historyExhaustive = false;
+    } catch { historyExhaustive = false; }
+
+    const status = String(order?.status || '');
+    if (/open|new|resting|pending|acknowledged|partial/i.test(status)) {
+      t.goneAttempts = 0;
+      t.seen = true;
+      return;
+    }
+    const totals = matches.reduce((acc, fill) => {
+      const size = Number(fill.size);
+      const price = Number(fill.price);
+      if (size > 0) {
+        acc.size += size;
+        if (price > 0) acc.notional += size * price;
+      }
+      return acc;
+    }, { size: 0, notional: 0 });
+    if (totals.size > 0) {
+      verdict = 'filled';
+      fillSize = totals.size;
+      if (totals.notional > 0) fillPrice = totals.notional / totals.size;
+    } else if (order) {
+      const filled = Number(order.filled_size ?? 0);
+      if (filled > 0 || /fill|filled|matched|closed/i.test(status)) {
+        verdict = 'filled';
+        if (filled > 0) fillSize = filled;
+        const price = Number(order.price);
+        if (price > 0) fillPrice = price;
+      } else if (/cancel|reject|expire/i.test(status)) verdict = 'cancelled';
+    }
+
+    if (verdict === 'unknown') {
+      t.goneAttempts = (t.goneAttempts || 0) + 1;
+      if (t.goneAttempts < 12 || !historyExhaustive) return;
+      verdict = 'cancelled';
+    }
+    this._tracked.delete(String(id));
+    if (verdict === 'filled') {
+      this.emit('fill', { orderId: String(id), marketId: t.marketId, side: t.side, price: fillPrice, sizeBase: fillSize, levelIndex: t.levelIndex });
+    } else {
+      this.emit('error', new Error(`订单 ${id}（${t.side} @ ${t.price}）未能通过 RISEx 账户历史确认成交，已停止跟踪（不补单）。`));
+    }
   }
 
   async _refreshAccount() {

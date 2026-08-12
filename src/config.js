@@ -75,7 +75,8 @@ export function getConfig() {
   const rsDefaults =
     rsNet === 'testnet'
       ? { api: 'https://api.testnet.rise.trade', ws: 'wss://ws.testnet.rise.trade' }
-      : { api: 'https://api.risex.trade', ws: 'wss://ws.risex.trade' };
+      // api.risex.trade 在部分网络下 DNS 不可解析；主网 REST 用 api.rise.trade
+      : { api: 'https://api.rise.trade', ws: 'wss://ws.rise.trade' };
 
   const rs = {
     mode: (process.env.RS_MODE || 'paper').toLowerCase() === 'live' ? 'live' : 'paper',

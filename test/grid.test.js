@@ -2,7 +2,9 @@
 // Extended signing/precision helpers (src/exchange/ex/starkcrypto.js).
 // Run with: npm test
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { buildGrid, seedOrders, replacementFor, isReduceOnly, rungProfit } from '../src/grid.js';
+import { GridBot } from '../src/bot.js';
 import { selfTest, alignToStep, parseDec, settlementAmounts } from '../src/exchange/ex/starkcrypto.js';
 import { normalizeProxy } from '../src/proxy.js';
 
@@ -91,6 +93,24 @@ test('isReduceOnly matrix', () => {
 
 test('rungProfit', () => {
   assert.equal(rungProfit(10, 0.5), 5);
+});
+
+test('GridBot snapshot/restore keeps recent fills and alerts across restart', () => {
+  const before = new GridBot(new EventEmitter());
+  before.ex.mode = 'live';
+  before.config = {
+    marketId: 7, displayName: 'BTC-USD', mode: 'neutral', lower: 60000,
+    upper: 70000, gridCount: 10, sizeBase: 0.001, leverage: 3,
+  };
+  before.fills = [{ t: 123, side: 'buy', price: 62000, size: 0.001, level: 2 }];
+  before.alerts = [{ t: 124, message: '网格运行中' }];
+
+  const after = new GridBot(new EventEmitter());
+  after.ex.mode = 'live';
+  after.restore(before.snapshot());
+
+  assert.deepEqual(after.fills, before.fills);
+  assert.deepEqual(after.alerts, before.alerts);
 });
 
 console.log('starkcrypto.js');

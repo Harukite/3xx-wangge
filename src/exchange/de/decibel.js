@@ -82,6 +82,8 @@ export class DecibelExchange extends EventEmitter {
     this.subaccount = opts.subaccount || null; // trading account address
     this.apiUrl = opts.apiUrl || this.net.tradingHttpUrl;
     this.pollMs = opts.pollMs ?? 2000;            // 更快轮询以降低链上索引器滞后
+    this.cancelConfirmDelayMs = opts.cancelConfirmDelayMs ?? 400;
+    this.cancelConfirmAttempts = opts.cancelConfirmAttempts ?? 12;
     this._graceMs = this.pollMs * 2; // give a just-placed order time to be indexed before judging it "gone"
     this.lastOkAt = 0;               // 上次成功轮询时间（健康检测用）
     this.lastError = null;
@@ -263,17 +265,21 @@ export class DecibelExchange extends EventEmitter {
         const px = pickNum(p, 'mid_px', 'mark_px', 'oracle_px', 'last_px');
         const ts = pickNum(p, 'transaction_unix_ms');
         if (px > 0) {
+          const ageMs = ts == null ? null : Date.now() - ts;
+          const directFresh = ageMs != null && ageMs <= 15_000 && ageMs >= -5_000;
           // indexer rows can lag minutes behind the real market; if stale,
           // prefer the close of the latest 1m candle (separate data path)
-          if (ts && Date.now() - ts > 15_000) {  // 索引器行情超过15秒即视为陈旧，改用最新1m K线
+          if (!directFresh) {  // 索引器行情超过15秒或缺时间戳即视为陈旧，改用最新1m K线
             const fresh = await this._freshPriceFromCandles(m).catch(() => null);
             if (fresh > 0) { this._prices.set(mId, fresh); return fresh; }
+            if (opts.requireFresh) continue;
           }
           this._prices.set(mId, px);
           return px;
         }
       } catch { /* retry, then fall back */ }
     }
+    if (opts.requireFresh) return null;
     const last = this._prices.get(mId) ?? m.lastPrice;
     return last > 0 ? last : null; // null = no price known; callers must handle
   }
@@ -284,8 +290,16 @@ export class DecibelExchange extends EventEmitter {
     const data = await this.read.candlesticks.getByName({
       marketName: m.name, interval: '1m', startTime: end - 5 * 60 * 1000, endTime: end,
     });
-    const last = (data || []).filter((c) => Number.isFinite(+c.c)).pop();
-    return last ? +last.c : null;
+    const latest = (Array.isArray(data) ? data : [])
+      .map((c) => {
+        const rawTime = pickNum(c, 'T', 't', 'timestamp', 'time');
+        const time = rawTime != null && rawTime < 1e12 ? rawTime * 1000 : rawTime;
+        return { time, close: Number(c.c ?? c.close) };
+      })
+      .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close) && c.close > 0)
+      .sort((a, b) => b.time - a.time)[0];
+    if (!latest || end - latest.time > 90_000 || latest.time - end > 15_000) return null;
+    return latest.close;
   }
 
   // ---------- trading ----------
@@ -332,37 +346,107 @@ export class DecibelExchange extends EventEmitter {
     this._watch.add(m.marketId);
     this._tracked.set(orderId, {
       marketId: m.marketId, levelIndex: o.levelIndex, side: o.side,
-      price: priceUsed, sizeBase: sizeUsed, seen: false,
+      price: priceUsed, sizeBase: sizeUsed, reduceOnly: !!o.reduceOnly, seen: false,
       placedAt: Date.now(), goneAttempts: 0, resolving: false,
     });
-    return { orderId };
+    return { orderId, priceUsed, sizeUsed };
   }
 
   async cancelOrder(marketId, orderId) {
     const m = this._market(marketId);
+    const result = await this.write.cancelOrder({ orderId: String(orderId), marketName: m.name, subaccountAddr: this.subaccount });
+    if (result?.success !== true) return false;
     this._tracked.delete(String(orderId));
-    return this.write.cancelOrder({ orderId: String(orderId), marketName: m.name, subaccountAddr: this.subaccount });
+    return true;
   }
 
   async cancelAll(marketId) {
     const m = this._market(marketId);
-    for (const [id, o] of this._tracked) if (o.marketId === m.marketId) this._tracked.delete(id);
-    try {
-      const open = await this._openOrders();
-      for (const o of open) {
-        if (String(o.market) !== m.addr && String(o.market) !== m.name) continue;
-        if (o.is_tpsl) continue; // leave TP/SL attached to positions alone
-        try {
-          await this.write.cancelOrder({ orderId: String(o.order_id), marketName: m.name, subaccountAddr: this.subaccount });
-        } catch (e) { this.emit('error', e); }
+    const orderIds = new Set(
+      [...this._tracked].filter(([, tracked]) => tracked.marketId === m.marketId).map(([id]) => String(id)),
+    );
+    const confirmedSubmissions = new Set();
+    const ordinaryRows = (rows) => rows.filter((order) =>
+      (String(order.market) === m.addr || String(order.market) === m.name) && !order.is_tpsl);
+    const submitCancel = async (orderId) => {
+      try {
+        const result = await this.write.cancelOrder({
+          orderId, marketName: m.name, subaccountAddr: this.subaccount,
+        });
+        if (result?.success === true) confirmedSubmissions.add(orderId);
+        return result?.success === true;
+      } catch (e) {
+        if (this.listenerCount('error')) this.emit('error', e);
+        return false;
       }
-      return true;
-    } catch (e) { this.emit('error', e); return false; }
+    };
+
+    // cancelBulkOrder only clears Decibel's bulk-order state. Grid orders are
+    // ordinary placeOrder GTC orders, so enumerate and cancel them one by one.
+    let rows;
+    try { rows = await this._openOrders(); } catch { rows = null; }
+    if (!Array.isArray(rows)) return false;
+    const initial = ordinaryRows(rows);
+    if (initial.some((order) => order.order_id == null || order.order_id === '')) return false;
+    for (const order of initial) orderIds.add(String(order.order_id));
+    // Aptos transactions share an account sequence number; keep submissions
+    // serialized unless the SDK explicitly provides its own batching primitive.
+    for (const orderId of orderIds) await submitCancel(orderId);
+
+    // The indexer can transiently return a false-empty snapshot. Require three
+    // consecutive empty reads, and cancel any late-appearing ordinary order.
+    let emptyStreak = initial.length === 0 ? 1 : 0;
+    for (let attempt = 0; attempt < this.cancelConfirmAttempts; attempt++) {
+      try { rows = await this._openOrders(); } catch { rows = null; }
+      if (!Array.isArray(rows)) {
+        emptyStreak = 0;
+      } else {
+        const remaining = ordinaryRows(rows);
+        if (remaining.some((order) => order.order_id == null || order.order_id === '')) return false;
+        if (!remaining.length) {
+          emptyStreak += 1;
+          if (emptyStreak >= 3) {
+            for (const [id, tracked] of this._tracked) {
+              if (tracked.marketId === m.marketId) this._tracked.delete(id);
+            }
+            return true;
+          }
+        } else {
+          emptyStreak = 0;
+          for (const order of remaining) {
+            const orderId = String(order.order_id);
+            if (!confirmedSubmissions.has(orderId)) await submitCancel(orderId);
+          }
+        }
+      }
+      if (attempt + 1 < this.cancelConfirmAttempts && this.cancelConfirmDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.cancelConfirmDelayMs));
+      }
+    }
+    return false;
   }
 
   async _openOrders() {
-    const r = await this.read.userOpenOrders.getByAddr({ subAddr: this.subaccount, limit: 500, offset: 0 });
-    return Array.isArray(r) ? r : (r?.items || []);
+    const limit = 500;
+    const all = [];
+    let offset = 0;
+    for (let page = 0; page < 20; page++) {
+      const r = await this.read.userOpenOrders.getByAddr({
+        subAddr: this.subaccount, limit, offset,
+      });
+      const rows = Array.isArray(r) ? r : (Array.isArray(r?.items) ? r.items : null);
+      if (!rows) return null;
+      all.push(...rows);
+      const total = !Array.isArray(r) && r?.total_count != null && Number.isFinite(Number(r.total_count))
+        ? Number(r.total_count) : null;
+      if (total != null && all.length >= total) return all;
+      if (!rows.length) return total != null && all.length < total ? null : all;
+      if (rows.length < limit && total == null) return all;
+      offset += rows.length;
+    }
+    // The endpoint stayed full through the safety cap (or ignored offset).
+    // Returning null prevents callers from mistaking a truncated list for all.
+    return null;
   }
 
   getOpenOrders(marketId) {
@@ -373,6 +457,7 @@ export class DecibelExchange extends EventEmitter {
   async fetchOpenOrders(marketId) {
     const m = this._market(marketId);
     const rows = await this._openOrders();
+    if (!Array.isArray(rows)) return null;
     const out = [];
     for (const o of rows) {
       if (String(o.market) !== m.addr && String(o.market) !== m.name) continue;
@@ -389,25 +474,62 @@ export class DecibelExchange extends EventEmitter {
           if (Math.abs(conv - ref) < Math.abs(px - ref)) px = conv;
         }
       }
-      const side = (o.is_buy === true || /buy|long/i.test(String(o.side ?? ''))) ? 'buy' : 'sell';
-      out.push({ orderId: String(o.order_id), price: px, side });
+      const side = typeof o.is_buy === 'boolean' ? (o.is_buy ? 'buy' : 'sell') : null;
+      const sizeBase = o.remaining_size != null && o.remaining_size !== '' ? Number(o.remaining_size) : null;
+      const reduceOnly = typeof o.is_reduce_only === 'boolean' ? o.is_reduce_only : null;
+      const clientOrderId = o.client_order_id != null ? String(o.client_order_id) : null;
+      const metadataComplete = !!o.order_id && Number.isFinite(px) && px > 0
+        && ['buy', 'sell'].includes(side) && Number.isFinite(sizeBase) && sizeBase > 0
+        && typeof reduceOnly === 'boolean';
+      out.push({
+        orderId: String(o.order_id),
+        ...(clientOrderId != null ? { clientOrderId } : {}),
+        price: Number.isFinite(px) ? px : null, side, sizeBase, reduceOnly, metadataComplete,
+      });
     }
     return out;
   }
 
   /** Re-attach a previously-placed order to this adapter's tracking (resume). */
-  adoptOrder({ orderId, marketId, levelIndex, side, price, sizeBase }) {
+  adoptOrder({ orderId, marketId, levelIndex, side, price, sizeBase, reduceOnly = false }) {
     const mId = Number(marketId);
     this._watch.add(mId);
     this._tracked.set(String(orderId), {
       marketId: mId, levelIndex, side, price: Number(price), sizeBase: Number(sizeBase),
-      seen: false, placedAt: Date.now(), goneAttempts: 0, resolving: false,
+      reduceOnly: !!reduceOnly, seen: false, placedAt: Date.now(), goneAttempts: 0, resolving: false,
     });
   }
 
   getPosition(marketId) {
     const p = this._pos.get(Number(marketId));
     return p && p.sizeBase !== 0 ? p : null;
+  }
+
+  async refreshPosition(marketId) {
+    const m = this._market(marketId);
+    const ps = await this.read.userPositions.getByAddr({ subAddr: this.subaccount });
+    const rows = Array.isArray(ps) ? ps : (ps?.positions || []);
+    const p = rows.find((row) => {
+      const market = this._byAddr.get(String(row.market)) || [...this.markets.values()].find((item) => item.name === row.market_name);
+      return market?.marketId === m.marketId;
+    });
+    if (!p || p.is_deleted || !Number(p.size ?? p.open_size ?? 0)) {
+      this._pos.delete(m.marketId);
+      return null;
+    }
+    let size = Number(p.size ?? p.open_size ?? 0);
+    if (p.is_long === false && size > 0) size = -size;
+    if (typeof p.side === 'string' && /short|sell/i.test(p.side) && size > 0) size = -size;
+    const entry = Number(p.entry_price ?? 0);
+    const mark = this._prices.get(m.marketId) || entry;
+    const position = {
+      sizeBase: size, entryPrice: entry,
+      unrealizedPnl: Number(p.unrealized_pnl ?? (size * (mark - entry))),
+      exUpnl: pickNum(p, 'unrealized_pnl'),
+      leverage: p.user_leverage != null ? Number(p.user_leverage) : null,
+    };
+    this._pos.set(m.marketId, position);
+    return position;
   }
 
   /** Close the current position with a reduce-only IOC order at a worst-case price. */
@@ -552,34 +674,58 @@ export class DecibelExchange extends EventEmitter {
     // actually executed (filledQty > 0 / status FILLED). Anything inconclusive
     // defaults to "not filled": stop tracking, do NOT re-quote.
     let verdict = 'unknown';
+    let fillSize = t.sizeBase;
+    let fillPrice = t.price;
+    let historyExhaustive = true;
     try {
-      const h = await this.read.userOrderHistory.getByAddr({ subAddr: this.subaccount, limit: 100, offset: 0 });
-      const rows = Array.isArray(h) ? h : (h?.items || []);
-      const o = rows.find((r) => String(r.order_id) === String(id));
+      const limit = 100;
+      let o = null;
+      let offset = 0;
+      for (let page = 0; page < 20; page++) {
+        const h = await this.read.userOrderHistory.getByAddr({
+          subAddr: this.subaccount, limit, offset,
+        });
+        const rows = Array.isArray(h) ? h : (Array.isArray(h?.items) ? h.items : null);
+        if (!rows) { historyExhaustive = false; break; }
+        o = rows.find((row) => String(row.order_id) === String(id)) || null;
+        const total = !Array.isArray(h) && h?.total_count != null && Number.isFinite(Number(h.total_count))
+          ? Number(h.total_count) : null;
+        if (o || (total != null && offset + rows.length >= total)) break;
+        if (!rows.length) {
+          if (total != null && offset < total) historyExhaustive = false;
+          break;
+        }
+        if (rows.length < limit && total == null) break;
+        offset += rows.length;
+        if (page === 19) historyExhaustive = false;
+      }
       if (o) {
         const st = String(o.status || '');
         const fillQty = Number(o.orig_size ?? 0) - Number(o.remaining_size ?? 0);
-        if (fillQty > 0 || /fill|filled|matched|closed/i.test(st)) verdict = 'filled';
-        else if (/cancel|reject|expire/i.test(st)) verdict = 'cancelled';
-        else if (/open|new|resting|pending|acknowledged/i.test(st)) {
-          // history says the order is STILL LIVE: the open-orders snapshot that
-          // hid it was an indexer glitch — revive tracking instead of counting
-          // toward the give-up threshold.
+        if (/open|new|resting|pending|acknowledged|partial/i.test(st)) {
+          // A partial fill is not terminal: keep tracking the remaining order.
           t.goneAttempts = 0;
           t.seen = true;
           return;
         }
+        if (fillQty > 0 || /fill|filled|matched|closed/i.test(st)) {
+          verdict = 'filled';
+          if (fillQty > 0) fillSize = fillQty;
+          const historyPrice = pickNum(o, 'average_price', 'avg_price', 'fill_price', 'price');
+          if (historyPrice > 0) fillPrice = historyPrice;
+        }
+        else if (/cancel|reject|expire/i.test(st)) verdict = 'cancelled';
       }
-    } catch { /* keep 'unknown' */ }
+    } catch { historyExhaustive = false; }
 
     if (verdict === 'unknown') {
       t.goneAttempts = (t.goneAttempts || 0) + 1;
-      if (t.goneAttempts < 6) return; // re-check; a lagging indexer can briefly hide a resting order
+      if (t.goneAttempts < 6 || !historyExhaustive) return; // re-check; a lagging/truncated indexer can hide a resting order
       verdict = 'cancelled';          // never positively confirmed filled -> assume NOT filled
     }
     this._tracked.delete(id);
     if (verdict === 'filled') {
-      this.emit('fill', { orderId: id, marketId: t.marketId, side: t.side, price: t.price, sizeBase: t.sizeBase, levelIndex: t.levelIndex });
+      this.emit('fill', { orderId: id, marketId: t.marketId, side: t.side, price: fillPrice, sizeBase: fillSize, levelIndex: t.levelIndex });
     } else {
       this.emit('error', new Error(`订单 ${id}（${t.side} @ ${t.price}）未确认成交，已停止跟踪（不补单）。`));
     }

@@ -8,7 +8,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 COPY package.json package-lock.json ./
-RUN npm ci --omit=optional || npm install --omit=optional
+RUN npm ci --omit=dev || npm install --omit=dev
+# RISEx 实盘适配器在运行时动态加载此包；构建时即验证，避免重部署后才发现镜像漏装。
+RUN node -e "import('risex-client')"
 
 # ── 运行阶段 ───────────────────────────────────────────────
 FROM node:20-bookworm-slim AS run
@@ -24,11 +26,11 @@ COPY --chown=node:node package.json ./
 COPY --chown=node:node src ./src
 COPY --chown=node:node public ./public
 COPY --chown=node:node test ./test
-# data/（SQLite）与 .state.json 运行时写入：预先创建并归属 node 用户
+# data/（SQLite + 网格运行快照）运行时写入：预先创建并归属 node 用户
 RUN mkdir -p data && chown -R node:node /app
 EXPOSE 8080
 USER node
 # 容器健康检查（Dokploy / Docker 探活；用 node 内置 fetch，免装 curl）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/live').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 CMD ["node", "src/server.js"]

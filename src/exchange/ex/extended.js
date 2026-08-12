@@ -39,6 +39,8 @@ export class ExtendedExchange extends EventEmitter {
     this.network = opts.network || 'mainnet';
     this.feeRate = opts.feeRate || '0.0005'; // max fee signed into orders (taker is 0.00025)
     this.pollMs = opts.pollMs ?? 2500;
+    this.cancelConfirmDelayMs = opts.cancelConfirmDelayMs ?? 400;
+    this.cancelConfirmAttempts = opts.cancelConfirmAttempts ?? 12;
     this._graceMs = this.pollMs * 2; // grace before judging a just-placed order "gone"
     this.lastOkAt = 0;
     this.lastError = null;
@@ -190,7 +192,8 @@ export class ExtendedExchange extends EventEmitter {
       const bid = Number(book?.bid?.[0]?.price), ask = Number(book?.ask?.[0]?.price);
       if (bid && ask) { const mid = (bid + ask) / 2; this._prices.set(mId, mid); return mid; }
       if (bid || ask) { const px = bid || ask; this._prices.set(mId, px); return px; }
-    } catch { /* fall back */ }
+    } catch { /* fall back only when a fresh quote was not required */ }
+    if (opts.requireFresh) return null;
     return this._prices.get(mId) ?? m.lastPrice;
   }
 
@@ -263,22 +266,61 @@ export class ExtendedExchange extends EventEmitter {
     this._watch.add(m.marketId);
     this._tracked.set(orderId, {
       marketId: m.marketId, levelIndex: o.levelIndex, side: o.side,
-      price: Number(priceStr), sizeBase: Number(qtyStr), seen: false,
+      price: Number(priceStr), sizeBase: Number(qtyStr), reduceOnly: !!o.reduceOnly, seen: false,
       externalId, placedAt: Date.now(), goneAttempts: 0, resolving: false,
     });
-    return { orderId };
+    return { orderId, externalId, priceUsed: Number(priceStr), sizeUsed: Number(qtyStr) };
   }
 
-  async cancelOrder(marketId, orderId) {
-    this._tracked.delete(String(orderId));
-    return this._req('DELETE', `/api/v1/user/order/${orderId}`);
+  async cancelOrder(marketId, orderId, opts = {}) {
+    const tracked = this._tracked.get(String(orderId));
+    const identity = opts.externalId ?? tracked?.externalId;
+    if (!identity) return false;
+    const result = await this._req('DELETE', `/api/v1/user/order?externalId=${encodeURIComponent(identity)}`);
+    if (result === false || result?.success === false) return false;
+    const cleared = await this._confirmOrdersGone(
+      marketId, new Set([String(orderId), String(identity)]),
+    );
+    if (cleared) this._tracked.delete(String(orderId));
+    return cleared;
   }
 
   async cancelAll(marketId) {
     const m = this._market(marketId);
-    for (const [id, o] of this._tracked) if (o.marketId === m.marketId) this._tracked.delete(id);
-    try { return await this._req('POST', '/api/v1/user/order/massCancel', { markets: [m.name] }); }
+    try {
+      const result = await this._req('POST', '/api/v1/user/order/massCancel', { markets: [m.name] });
+      if (result === false || result?.success === false) return false;
+      const cleared = await this._confirmOrdersGone(m.marketId);
+      if (!cleared) return false;
+      for (const [id, o] of this._tracked) if (o.marketId === m.marketId) this._tracked.delete(id);
+      return true;
+    }
     catch (e) { this.emit('error', e); return false; }
+  }
+
+  async _confirmOrdersGone(marketId, identities = null) {
+    let emptyStreak = 0;
+    for (let attempt = 0; attempt < this.cancelConfirmAttempts; attempt++) {
+      let open;
+      try { open = await this.fetchOpenOrders(marketId); }
+      catch { open = null; }
+      if (!Array.isArray(open)) {
+        emptyStreak = 0;
+      } else {
+        const malformed = identities && open.some((order) =>
+          order?.orderId == null && order?.externalId == null);
+        const remaining = identities
+          ? open.filter((order) => identities.has(String(order.orderId))
+            || identities.has(String(order.externalId)))
+          : open;
+        emptyStreak = !malformed && remaining.length === 0 ? emptyStreak + 1 : 0;
+        if (emptyStreak >= 2) return true;
+      }
+      if (attempt + 1 < this.cancelConfirmAttempts && this.cancelConfirmDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.cancelConfirmDelayMs));
+      }
+    }
+    return false;
   }
 
   getOpenOrders(marketId) {
@@ -292,26 +334,113 @@ export class ExtendedExchange extends EventEmitter {
     // A missing/malformed payload is NOT "zero orders" — return null so the
     // reconciler skips this cycle instead of pruning live orders off tracking.
     if (!Array.isArray(data)) return null;
-    return data.map((o) => ({
-      orderId: String(o.id),
-      price: Number(o.price),
-      side: String(o.side || '').toLowerCase() === 'buy' ? 'buy' : 'sell',
-    }));
+    return data.map((o) => {
+      const orderId = o.id != null ? String(o.id) : null;
+      const externalId = o.externalId != null ? String(o.externalId) : null;
+      const price = o.price != null && o.price !== '' ? Number(o.price) : null;
+      const sideText = String(o.side || '').toUpperCase();
+      const side = sideText === 'BUY' ? 'buy' : (sideText === 'SELL' ? 'sell' : null);
+      const qty = o.qty != null && o.qty !== '' ? Number(o.qty) : null;
+      const type = o.type != null ? String(o.type).toUpperCase() : null;
+      const status = o.status != null ? String(o.status).toUpperCase() : null;
+      const hasFilledQty = o.filledQty != null && o.filledQty !== '';
+      const filledQty = hasFilledQty ? Number(o.filledQty) : (status === 'NEW' ? 0 : null);
+      const cancelledQty = o.cancelledQty != null && o.cancelledQty !== '' ? Number(o.cancelledQty) : 0;
+      const sizeBase = Number.isFinite(qty) && Number.isFinite(filledQty) && Number.isFinite(cancelledQty)
+        ? qty - filledQty - cancelledQty : null;
+      const reduceOnly = typeof o.reduceOnly === 'boolean' ? o.reduceOnly : null;
+      const fillStatusConsistent = status === 'NEW'
+        ? filledQty === 0
+        : status === 'PARTIALLY_FILLED' && hasFilledQty && Number.isFinite(filledQty) && filledQty > 0;
+      const metadataComplete = orderId != null && externalId != null && Number.isFinite(price) && price > 0
+        && ['buy', 'sell'].includes(side) && Number.isFinite(qty) && qty > 0
+        && Number.isFinite(filledQty) && filledQty >= 0 && filledQty <= qty
+        && Number.isFinite(cancelledQty) && cancelledQty >= 0 && cancelledQty <= qty - filledQty
+        && Number.isFinite(sizeBase) && sizeBase > 0 && typeof reduceOnly === 'boolean'
+        && type === 'LIMIT' && fillStatusConsistent;
+      return {
+        orderId, ...(externalId != null ? { externalId } : {}),
+        price: Number.isFinite(price) ? price : null, side, sizeBase, reduceOnly, metadataComplete,
+      };
+    });
+  }
+
+  /**
+   * Old snapshots predate persistence of the full-precision order hash. Enrich
+   * only from an order that is still visibly open with the exact same server
+   * id; if it vanished while we were offline, its history identity is
+   * ambiguous and automatic takeover must fail closed.
+   */
+  async prepareResumeOrders(entries, marketId) {
+    if (!Array.isArray(entries) || entries.every(([, info]) => info?.externalId != null)) return entries;
+    const open = await this.fetchOpenOrders(marketId);
+    if (!Array.isArray(open)) throw new Error('Extended 未返回有效挂单列表，无法补全旧快照订单身份');
+    return entries.map(([rawId, rawInfo]) => {
+      const id = String(rawId);
+      const info = { ...rawInfo };
+      if (info.externalId != null) return [id, info];
+      const matches = open.filter((order) => String(order.orderId) === id && order.externalId != null);
+      if (matches.length !== 1) {
+        throw new Error(`旧版 Extended 订单 ${id} 缺少稳定 externalId，且无法从当前挂单唯一补全`);
+      }
+      info.externalId = String(matches[0].externalId);
+      return [id, info];
+    });
   }
 
   /** Re-attach a previously-placed order to this adapter's tracking (resume). */
-  adoptOrder({ orderId, marketId, levelIndex, side, price, sizeBase }) {
+  adoptOrder({ orderId, externalId, marketId, levelIndex, side, price, sizeBase, reduceOnly = false }) {
     const mId = Number(marketId);
     this._watch.add(mId);
     this._tracked.set(String(orderId), {
       marketId: mId, levelIndex, side, price: Number(price), sizeBase: Number(sizeBase),
-      seen: false, placedAt: Date.now(), goneAttempts: 0, resolving: false,
+      externalId: externalId != null ? String(externalId) : null,
+      reduceOnly: !!reduceOnly, seen: false, placedAt: Date.now(), goneAttempts: 0, resolving: false,
     });
   }
 
   getPosition(marketId) {
     const p = this._pos.get(Number(marketId));
     return p && p.sizeBase !== 0 ? p : null;
+  }
+
+  async refreshPosition(marketId) {
+    const m = this._market(marketId);
+    const ps = await this._get(`/api/v1/user/positions?market=${encodeURIComponent(m.name)}`);
+    if (!Array.isArray(ps)) throw new Error('Extended 持仓接口返回了非数组数据，拒绝将其判定为空仓。');
+    if (!ps.length) {
+      this._pos.delete(m.marketId);
+      return null;
+    }
+    const p = ps[0];
+    const rawSize = p?.size;
+    const size = Number(rawSize);
+    if (!p || typeof p !== 'object' || rawSize == null || rawSize === '' || !Number.isFinite(size)) {
+      throw new Error('Extended 持仓接口返回了畸形数据，拒绝将其判定为空仓。');
+    }
+    if (size === 0) {
+      this._pos.delete(m.marketId);
+      return null;
+    }
+    const side = String(p.side).toUpperCase();
+    const entryPrice = Number(p.openPrice);
+    if (!['LONG', 'SHORT'].includes(side) || !(entryPrice > 0)) {
+      throw new Error('Extended 持仓方向或开仓价无效，拒绝使用该持仓快照。');
+    }
+    const short = side === 'SHORT';
+    const unrealizedPnl = Number(p.unrealisedPnl ?? 0);
+    const leverage = p.leverage != null ? Number(p.leverage) : null;
+    if (!Number.isFinite(unrealizedPnl) || (leverage != null && !Number.isFinite(leverage))) {
+      throw new Error('Extended 持仓盈亏或杠杆数据无效，拒绝使用该持仓快照。');
+    }
+    const position = {
+      sizeBase: Math.abs(size) * (short ? -1 : 1),
+      entryPrice,
+      unrealizedPnl,
+      leverage,
+    };
+    this._pos.set(m.marketId, position);
+    return position;
   }
 
   /** Close the current position with a reduce-only IOC market order. */
@@ -405,6 +534,7 @@ export class ExtendedExchange extends EventEmitter {
   async _resolveGone(id, t) {
     let verdict = 'unknown';
     let fillPrice = t.price, fillSize = t.sizeBase;
+    let historyExhaustive = true;
     try {
       // A FILLED order is NOT returned by the open-orders endpoints — once it
       // fills it moves to ORDER HISTORY. So confirm via history (filtered by
@@ -420,33 +550,34 @@ export class ExtendedExchange extends EventEmitter {
       const mkt = this.markets.get(t.marketId)?.name;
       const data = await this._get(`/api/v1/user/orders/history?limit=200` + (mkt ? `&market=${encodeURIComponent(mkt)}` : ''));
       const rows = Array.isArray(data) ? data : [];
+      if (!Array.isArray(data)) historyExhaustive = false;
       const o = rows.find((x) =>
         (t.externalId && String(x.externalId) === String(t.externalId)) || String(x.id) === String(id));
+      if (!o && rows.length >= 200) historyExhaustive = false;
       if (o) {
         const fq = Number(o.filledQty ?? 0);
         const st = String(o.status || '');
-        if (fq > 0 || /FILLED/i.test(st)) {            // positive confirmation only
+        if (/NEW|OPEN|ACCEPTED|PENDING|UNTRIGGERED|PARTIAL/i.test(st)) {
+          // Partial history rows still represent a live remainder. Keep the
+          // order attached instead of replacing the whole intended quantity.
+          t.goneAttempts = 0;
+          t.seen = true;
+          return;
+        }
+        if (fq > 0 || /FILLED/i.test(st)) {            // positive terminal confirmation only
           verdict = 'filled';
           if (fq > 0) fillSize = fq;
           const avg = Number(o.averagePrice ?? 0);
           if (avg > 0) fillPrice = avg;
         } else if (/CANCELLED|REJECTED|EXPIRED/i.test(st)) {
           verdict = 'cancelled';
-        } else if (/NEW|OPEN|ACCEPTED|PENDING|UNTRIGGERED|PARTIAL/i.test(st)) {
-          // History says the order is STILL LIVE: the open-orders snapshot that
-          // reported it "gone" was a glitch. Revive tracking and bail out —
-          // counting these toward the give-up threshold used to drop dozens of
-          // perfectly live orders during an API hiccup.
-          t.goneAttempts = 0;
-          t.seen = true;
-          return;
         }
       }
-    } catch { /* keep 'unknown' */ }
+    } catch { historyExhaustive = false; }
 
     if (verdict === 'unknown') {
       t.goneAttempts = (t.goneAttempts || 0) + 1;
-      if (t.goneAttempts < 12) return; // re-check; tolerate order-history settlement lag
+      if (t.goneAttempts < 12 || !historyExhaustive) return; // re-check; tolerate settlement lag/truncated history
       verdict = 'cancelled';           // never confirmed filled -> assume NOT filled (no re-quote)
     }
     this._tracked.delete(id);

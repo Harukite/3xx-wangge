@@ -15,7 +15,7 @@ import { createExchange as createRsExchange } from './exchange/rs/index.js';
 import { GridBot } from './bot.js';
 import { analyzeTrend } from './trend.js';
 import { setupProxies, checkProxy } from './proxy.js';
-import { loadSnapshot, saveSnapshot, flushNow } from './persist.js';
+import { loadSnapshot, saveSnapshot, flushNow, getPersistenceHealth } from './persist.js';
 import { createAiService } from './ai/service.js';
 import { createAuth, clientIp } from './auth.js';
 import { createLimiter } from './ratelimit.js';
@@ -128,9 +128,21 @@ const deExchange = createDeExchange(cfg.de);
 const exExchange = createExExchange(cfg.ex);
 const rsExchange = createRsExchange(cfg.rs);
 
-const deBot = new GridBot(deExchange, { onChange: (s) => saveSnapshot('de', s) });
-const exBot = new GridBot(exExchange, { onChange: (s) => saveSnapshot('ex', s) });
-const rsBot = new GridBot(rsExchange, { onChange: (s) => saveSnapshot('rs', s) });
+const deBot = new GridBot(deExchange, {
+  onChange: (s) => saveSnapshot('de', s),
+  onCriticalChange: (s) => saveSnapshot('de', s, { immediate: true }),
+  canTrade: () => getPersistenceHealth().ok,
+});
+const exBot = new GridBot(exExchange, {
+  onChange: (s) => saveSnapshot('ex', s),
+  onCriticalChange: (s) => saveSnapshot('ex', s, { immediate: true }),
+  canTrade: () => getPersistenceHealth().ok,
+});
+const rsBot = new GridBot(rsExchange, {
+  onChange: (s) => saveSnapshot('rs', s),
+  onCriticalChange: (s) => saveSnapshot('rs', s, { immediate: true }),
+  canTrade: () => getPersistenceHealth().ok,
+});
 
 // Restore cumulative stats / config from the previous run (display continuity).
 // Trading does NOT auto-resume; stray-order cleanup happens after each exchange
@@ -299,6 +311,7 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
     // 若该所启动时未连上导致续跑被跳过（快照仍为运行状态），重连成功后自动续跑接管挂单。
     if (subPath === '/reconnect' && req.method === 'POST') {
       try {
+        const result = await bot._withMutation('reconnect', async () => {
         if (typeof exchange.reconnect === 'function') await exchange.reconnect();
         else if (typeof exchange.init === 'function') await exchange.init();
         let resumed = false, resumeError = null;
@@ -306,23 +319,62 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
           const key = prefix.split('/').pop(); // '/api/ex' -> 'ex'
           const snap = loadSnapshot(key);
           if (snap?.running && snap?.config) {
+            if (hasUnfinishedSnapshot(snap)) {
+              bot.restoreExchangeState(snap, { allowUnfinished: true });
+              resumeError = unfinishedSnapshotMessage(snap);
+              bot.blockTrading(resumeError);
+              return { ok: true, resumed, resumeError, state: bot.getState() };
+            }
             try {
-              // marketId 是按连接会话编号的，可能已漂移：按市场名称重新解析
-              const markets = await exchange.getMarkets();
-              const norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-              const m = markets.find((x) => norm(x.displayName) === norm(snap.config.displayName) || norm(x.name) === norm(snap.config.displayName));
-              if (m) snap.config.marketId = m.marketId;
+              // GridBot.resume 会按名称解析会话内 marketId，并同步重映射 paper 仓位/挂单。
               await bot.resume(snap);
               resumed = true;
               console.log(`[恢复] ${key.toUpperCase()} 重连成功后已自动续跑，接管挂单并完成对账。`);
             } catch (e) {
               resumeError = e?.message || String(e); // 续跑失败不撤单：挂单保留，可重启程序再试
+              bot.blockTrading(`运行中网格恢复失败（${resumeError}）`);
               console.error(`[恢复] ${key.toUpperCase()} 重连后续跑失败（${resumeError}），挂单保留未动。`);
+            }
+          } else if (snap && !snap.running && !hasUnfinishedSnapshot(snap)) {
+            bot.restoreExchangeState(snap);
+            if (bot.config) await bot.refreshMarketMapping();
+            bot.clearTradingBlock();
+          } else if (hasUnfinishedSnapshot(snap)) {
+            bot.restoreExchangeState(snap, { allowUnfinished: true });
+            resumeError = unfinishedSnapshotMessage(snap);
+            bot.blockTrading(resumeError);
+          } else if (bot.config) {
+            await bot.refreshMarketMapping();
+          }
+        } else {
+          await bot.refreshMarketMapping();
+          if (bot.tradingBlock === '状态持久化异常，无法保证重启后接管订单') {
+            try {
+              await bot.recoverPersistenceAndReconcile();
+              console.log('[恢复] 持久卷已恢复可写，已安全对账并解除临时交易锁。');
+            } catch (e) {
+              resumeError = e?.message || String(e);
+              console.error(`[恢复] 持久卷恢复后仍无法安全对账（${resumeError}），未自动下单。`);
+            }
+          }
+          if (bot.tradingBlock && /(恢复前无法核对真实挂单|恢复前安全核验失败)/.test(bot.tradingBlock)) {
+            try {
+              await bot.retryResumeReconciliation();
+              resumed = true;
+              console.log('[恢复] 重连对账成功，已继续执行持久化的补挂意图。');
+            } catch (e) {
+              resumeError = e?.message || String(e);
+              console.error(`[恢复] 重连后仍无法安全对账（${resumeError}），未自动下单。`);
             }
           }
         }
-        if (bot.running) await bot.reconcileOpenOrders().catch(() => {});
-        return send(res, 200, { ok: true, resumed, resumeError, state: bot.getState() });
+        if (bot.running && !bot.tradingBlock) await bot.reconcileOpenOrders({ withinMutation: true }).catch(() => {});
+        return { ok: true, resumed, resumeError, state: bot.getState() };
+        }, { allowBlocked: true });
+        // _withMutation may finish a deferred resume safety gate in its finally
+        // block. Do not send a success response until that final proof succeeds.
+        result.state = bot.getState();
+        return send(res, 200, result);
       } catch (e) {
         return send(res, 500, { error: e?.message || String(e) });
       }
@@ -359,8 +411,18 @@ const server = http.createServer(async (request, res) => {
   const p = url.pathname;
 
   try {
+    // Pure process liveness for Docker/Dokploy. Business recovery readiness is
+    // intentionally separate below: an unsafe-resume lock must keep the UI
+    // reachable for manual inspection instead of causing a restart loop.
+    if (p === '/api/live') return send(res, 200, { ok: true, ts: Date.now() });
+
     // ── 健康检查（公开，供 Dokploy/容器探活；不限流，探活频率低） ──────────
-    if (p === '/api/health') return send(res, 200, { ok: true, ts: Date.now() });
+    if (p === '/api/health') {
+      const persistence = getPersistenceHealth();
+      const tradingBlocks = [deBot, exBot, rsBot].map((bot) => bot.getOperationalBlock()).filter(Boolean);
+      const ok = persistence.ok && tradingBlocks.length === 0;
+      return send(res, ok ? 200 : 503, { ok, ts: Date.now(), persistence, tradingBlocks });
+    }
 
     // ── 全局请求限流（防 DDoS 泛洪；按客户端 IP，公开端点同样受保护） ───────
     const ip = clientIp(request);
@@ -748,16 +810,101 @@ await Promise.all([
   initExchange(rsExchange, 'RISEx', cfg.rs),
 ]);
 
+// A stopped paper grid may still retain a simulated position. Its ledger is
+// restored only after markets are loaded, because numeric market IDs can change
+// between deployments and must be resolved from the persisted stable names.
+for (const [key, bot] of [['de', deBot], ['ex', exBot], ['rs', rsBot]]) {
+  const snap = loadSnapshot(key);
+  if (!snap || snap.running) continue; // running snapshots are restored by resume() below
+  try { bot.restoreExchangeState(snap, { allowUnfinished: hasUnfinishedSnapshot(snap) }); }
+  catch (e) {
+    bot.blockTrading(`模拟盘账本未恢复（${e?.message || e}）`);
+    console.error(`[恢复] ${key.toUpperCase()} ${bot.tradingBlock}。请核对仓位后再启动。`);
+    continue;
+  }
+  if (hasUnfinishedSnapshot(snap)) {
+    bot.blockTrading(unfinishedSnapshotMessage(snap));
+  }
+}
+
+// 冷启动时外网探测偶发失败会落到合成行情；稍后自动重试一次（不打断已成功的 real）。
+{
+  const paperExs = [
+    ['de', 'Decibel', deExchange, deBot],
+    ['ex', 'Extended', exExchange, exBot],
+    ['rs', 'RISEx', rsExchange, rsBot],
+  ].filter(([, , ex]) => ex?.mode === 'paper' && ex.dataSource === 'synthetic' && typeof ex.reconnect === 'function');
+  if (paperExs.length) {
+    setTimeout(() => {
+      for (const [key, name, ex, bot] of paperExs) {
+        bot._withMutation('delayed-reconnect', async () => {
+          await ex.reconnect();
+          if (ex.dataSource !== 'real') return;
+          const snap = loadSnapshot(key);
+          if (!bot.running && snap?.running && snap?.config) {
+            if (hasUnfinishedSnapshot(snap)) {
+              try { bot.restoreExchangeState(snap, { allowUnfinished: true }); }
+              catch (e) { bot.blockTrading(`模拟盘账本未恢复（${e?.message || e}）`); return; }
+              bot.blockTrading(unfinishedSnapshotMessage(snap));
+              return;
+            }
+            try {
+              await bot.resume(snap);
+              console.log(`[恢复] ${key.toUpperCase()} 延迟重连后已自动续跑。`);
+            } catch (e) {
+              bot.blockTrading(`运行中网格恢复失败（${e?.message || e}）`);
+              console.error(`[恢复] ${key.toUpperCase()} 延迟重连后仍无法续跑（${e?.message || e}），未自动撤单。`);
+              return;
+            }
+          } else if (snap && !snap.running && !hasUnfinishedSnapshot(snap)) {
+            bot.restoreExchangeState(snap);
+            if (bot.config) await bot.refreshMarketMapping();
+            bot.clearTradingBlock();
+          } else if (hasUnfinishedSnapshot(snap)) {
+            bot.restoreExchangeState(snap, { allowUnfinished: true });
+            bot.blockTrading(unfinishedSnapshotMessage(snap));
+          } else if (bot.config) {
+            await bot.refreshMarketMapping();
+          }
+          if (bot.running) await bot.reconcileOpenOrders({ withinMutation: true }).catch(() => {});
+          console.log(`[${name}] 延迟重连成功 → 真实行情，市场映射已刷新`);
+        }, { allowBlocked: true }).catch(() => {});
+      }
+    }, 2500).unref?.();
+  }
+}
+
 // ── 崩溃恢复 / 续跑 ────────────────────────────────────────────────────────────
 // If a bot was "running" when the process died, RESUME it: re-attach to the
 // orders still resting on the exchange and keep managing the grid. If resume
-// fails (e.g. exchange offline), fall back to cancelling stray orders so we
-// never operate a half-known grid.
+// fails after a confirmed market mapping, cancel the same market's stray orders.
+// A preflight safety rejection must preserve all orders for manual inspection:
+// its persisted numeric marketId may now refer to another symbol or mode.
+function hasUnfinishedSnapshot(snap) {
+  return !!(snap?.pendingAction || (Array.isArray(snap?.pendingOrders) && snap.pendingOrders.length));
+}
+
+function unfinishedSnapshotMessage(snap) {
+  if (snap?.pendingAction) return `检测到未完成的 ${snap.pendingAction.type || '交易所'} 操作，请人工核对挂单和仓位`;
+  return `检测到 ${snap?.pendingOrders?.length || 0} 个结果尚未确认的下单请求，请人工核对交易所`;
+}
+
 async function resumeIfWasRunning(bot, exchange, key) {
   const snap = loadSnapshot(key);
-  if (!(snap?.running && snap?.config)) return;
+  if (!snap?.running) return;
+  if (!snap.config) {
+    throw new Error(`[恢复] ${key.toUpperCase()} 快照声明正在运行但缺少配置。为防止遗留挂单无人管理，程序已中止启动；请核对交易所挂单/仓位并修复状态文件。`);
+  }
   if (exchange.dataSource == null) {
+    bot.blockTrading('交易所离线，运行中网格尚未接管；挂单和仓位必须先核对');
     console.log(`[恢复] ${key.toUpperCase()} 交易所未连接，跳过续跑；保留挂单待下次连接。`);
+    return;
+  }
+  if (hasUnfinishedSnapshot(snap)) {
+    try { bot.restoreExchangeState(snap, { allowUnfinished: true }); }
+    catch (e) { bot.blockTrading(`模拟盘账本未恢复（${e?.message || e}）`); return; }
+    bot.blockTrading(unfinishedSnapshotMessage(snap));
+    console.error(`[恢复] ${key.toUpperCase()} ${bot.tradingBlock}，未自动操作。`);
     return;
   }
   try {
@@ -765,8 +912,13 @@ async function resumeIfWasRunning(bot, exchange, key) {
     await bot.resume(snap);
     console.log(`[恢复] ${key.toUpperCase()} 已续跑，接管挂单并完成对账。`);
   } catch (e) {
-    console.error(`[恢复] ${key.toUpperCase()} 续跑失败（${e?.message || e}），改为撤销遗留挂单。`);
-    await bot.recoverStrayOrders().catch(() => {});
+    if (e?.code === 'UNSAFE_RESUME') {
+      bot.blockTrading(`运行中网格恢复被拒绝（${e.message}）`);
+      console.error(`[恢复] ${key.toUpperCase()} 已安全拒绝续跑（${e.message}）。未自动撤单，请人工核对交易所挂单和仓位。`);
+    } else {
+      console.error(`[恢复] ${key.toUpperCase()} 续跑失败（${e?.message || e}），改为撤销已确认市场的遗留挂单。`);
+      await bot.recoverStrayOrders().catch(() => {});
+    }
   }
 }
 await Promise.all([
@@ -780,18 +932,15 @@ await Promise.all([
 // marketIds every run, so the persisted numeric id may point at the wrong market
 // — re-resolve it by the market NAME, then start watching it so the position is
 // polled into getState.
-const _norm = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 async function detectOrphanPosition(bot, ex) {
-  if (!bot.config?.displayName || ex.dataSource == null || typeof ex.getMarkets !== 'function') return;
+  if (bot.running || !bot.config?.displayName || ex.dataSource == null || typeof ex.getMarkets !== 'function') return;
   try {
-    const markets = await ex.getMarkets();
-    const want = _norm(bot.config.displayName);
-    const m = markets.find((x) => _norm(x.displayName) === want || _norm(x.name) === want || _norm(x.symbol) === want);
-    if (m) {
-      bot.config.marketId = m.marketId;            // fix stale/ephemeral id -> current
-      await ex.getPrice(m.marketId).catch(() => {}); // seed watch -> position gets polled
-    }
-  } catch { /* ignore */ }
+    await bot.refreshMarketMapping();
+    await ex.getPrice(bot.config.marketId).catch(() => {}); // seed watch -> position gets polled
+  } catch (e) {
+    bot.blockTrading(`遗留仓位市场解析失败（${e?.message || e}）`);
+    console.error(`[恢复] ${bot.tradingBlock}，未自动操作。`);
+  }
 }
 await Promise.all([
   detectOrphanPosition(deBot, deExchange),
@@ -819,16 +968,45 @@ server.listen(cfg.port, cfg.host, () => {
 // ── 优雅关闭（容器收到 SIGTERM/SIGINT 时保存状态再退出）────────────────────────
 // 容器编排（Dokploy/Docker）停止时发 SIGTERM；此处强制落盘快照，保证重启后能续跑。
 let _shuttingDown = false;
-function gracefulShutdown(sig) {
+async function gracefulShutdown(sig) {
   if (_shuttingDown) return;
   _shuttingDown = true;
   console.log(`\n[关闭] 收到 ${sig}，保存状态后退出…`);
-  try { saveSnapshot('de', deBot.snapshot()); } catch { /* ignore */ }
-  try { saveSnapshot('ex', exBot.snapshot()); } catch { /* ignore */ }
-  try { saveSnapshot('rs', rsBot.snapshot()); } catch { /* ignore */ }
-  try { flushNow(); } catch { /* ignore */ }
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 5000).unref(); // 兜底：5s 后强制退出
+  for (const bot of [deBot, exBot, rsBot]) bot.beginShutdown();
+  const persistLatest = async () => {
+    let snapshotsSaved = true;
+    for (const [key, bot] of [['de', deBot], ['ex', exBot], ['rs', rsBot]]) {
+      try { saveSnapshot(key, bot.snapshot()); }
+      catch (e) {
+        snapshotsSaved = false;
+        console.error(`[关闭] ${key.toUpperCase()} 状态进入持久化缓存失败：${e?.message || e}`);
+      }
+    }
+    let flushed = false;
+    if (snapshotsSaved) {
+      for (let attempt = 1; attempt <= 3 && !flushed; attempt += 1) {
+        try { flushed = flushNow(); }
+        catch (e) { console.error(`[关闭] 第 ${attempt} 次状态落盘失败：${e?.message || e}`); }
+        if (!flushed && attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
+    }
+    return snapshotsSaved && flushed;
+  };
+
+  let persisted = await persistLatest();
+  let exited = false;
+  const finish = async () => {
+    if (exited) return;
+    exited = true;
+    // A fill can arrive while HTTP/SSE connections are draining. Capture one
+    // final snapshot immediately before process exit so that tail window is not lost.
+    persisted = (await persistLatest()) && persisted;
+    const exitCode = persisted ? 0 : 1;
+    if (exitCode) console.error('[关闭] 网格状态未能可靠落盘，将以失败状态退出；请勿在未核对交易所挂单/仓位前重新开网格。');
+    process.exit(exitCode);
+  };
+  server.close(() => { finish(); });
+  setTimeout(() => { finish(); }, 5000).unref(); // 兜底：5s 后强制退出
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
