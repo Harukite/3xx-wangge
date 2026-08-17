@@ -1,0 +1,26 @@
+name: grid-bot
+
+services:
+  grid-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - grid-bot-data:/app/data
+
+volumes:
+  # A stable name is intentional: `docker compose up` recreates the container
+  # without creating a fresh volume, so grid-state.json and app.db survive.
+  grid-bot-data:
+    name: grid-bot-data

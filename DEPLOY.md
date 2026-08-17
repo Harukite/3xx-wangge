@@ -8,6 +8,18 @@
 - 代码已推送到 Git 仓库（如 `github.com/Harukite/3xx-wangge`）。
 - 项目自带 `Dockerfile`，Dokploy 用 Docker 类型构建即可。
 
+## 推荐：一键自动持久化部署
+
+仓库自带 `compose.yaml`，会自动创建固定名称的 `grid-bot-data` 命名卷并挂载到 `/app/data`。在 Docker 主机上执行：
+
+```bash
+docker compose up -d --build
+```
+
+之后重新部署只需再次执行同一条命令；不要执行 `docker compose down -v`，否则会主动删除运行记录。凭据仍通过 `.env` 或平台环境变量注入，不能由程序自动生成。
+
+如果使用 Dokploy，请将应用部署类型选为 **Compose**，让 Dokploy 使用仓库根目录的 `compose.yaml`。这样不需要每次手动添加 Persistent Storage。若仍使用 Dokploy 的 Dockerfile 模式，则必须在平台配置 `/app/data` 持久卷一次。
+
 ## 部署步骤
 
 ### 1. 新建应用

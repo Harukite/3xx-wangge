@@ -3,15 +3,16 @@
 ## 最近运行
 
 - 2026-08-13：完成重新部署持久化、安全续跑闸门及交易动作 crash-window 修复；`npm test`、全部改动 JS 的 Node 语法检查、`git diff --check`、生产依赖 dry-run、`npm ls --depth=0` 与 RISEx 动态 import 验证通过。三路独立终审均批准固定候选。Docker 镜像未能在本机构建，因 Docker daemon 不可用。
+- 2026-08-17：新增 `compose.yaml` 固定命名卷 `grid-bot-data`，`docker compose up -d --build` 自动创建并复用 `/app/data`，减少重新部署时的手动卷配置。
 
 ## 当前任务
 
 - 修复重新部署后，部署前正在执行的网格策略及其运行记录消失的问题。
-- 当前阶段：已实现并通过正式验证与三路独立终审；生产需确认唯一持久卷 `/app/data`、副本数 1。
+- 当前阶段：已实现并通过正式验证与三路独立终审；已增加 Compose 一键持久化入口，生产仍需使用 Compose 部署或在 Dokploy Dockerfile 模式下配置一次 `/app/data`。
 
 ## 未决
 
-- 待运维确认生产 Dokploy 的 `/app/data` 命名卷实际存在且 `node` 用户可写。
+- 待运维确认生产 Dokploy 是否切换到仓库 `compose.yaml`；若继续 Dockerfile 模式，仍需确认 `/app/data` 命名卷实际存在且 `node` 用户可写。
 - 若旧容器仍存在，升级前按 `DEPLOY.md` 的停网格/撤单/核对/迁移步骤处理旧 `.state.json`。
 
 ## 已知之险

@@ -28,6 +28,9 @@ COPY --chown=node:node public ./public
 COPY --chown=node:node test ./test
 # data/（SQLite + 网格运行快照）运行时写入：预先创建并归属 node 用户
 RUN mkdir -p data && chown -R node:node /app
+# Fallback for plain `docker run`: Compose and Dokploy should still provide a
+# stable named volume, but this keeps /app/data outside the container layer.
+VOLUME ["/app/data"]
 EXPOSE 8080
 USER node
 # 容器健康检查（Dokploy / Docker 探活；用 node 内置 fetch，免装 curl）
