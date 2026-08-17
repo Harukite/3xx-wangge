@@ -29,6 +29,7 @@ export class PaperExchange extends EventEmitter {
     ]))];
     this.apiUrl = this.candidates[0];
     this.dataSource = 'connecting';   // 'real' | 'synthetic'
+    this.candleDataSource = 'connecting'; // K 线数据源独立于实时价格数据源
     this.network = null;              // 'mainnet' | 'testnet' | null
     this.tickMs = opts.tickMs ?? 1000;
     this.pollMs = opts.pollMs ?? 5000;
@@ -56,10 +57,12 @@ export class PaperExchange extends EventEmitter {
     if (chosen) {
       this.apiUrl = chosen;
       this.dataSource = 'real';
+      this.candleDataSource = 'connecting';
       this.network = chosen.includes('testnet') ? 'testnet' : 'mainnet';
     } else {
       if (!this.apiKey) console.log('[模拟模式] 未配置 DECIBEL_API_KEY，无法读取 Decibel 真实行情，使用合成行情。在 geomi.dev 免费创建 API key 后填入 .env 即可显示真实价格。');
       this.dataSource = 'synthetic';
+      this.candleDataSource = 'synthetic';
       this._setMarkets(FALLBACK_MARKETS.map((m) => ({ ...m })));
     }
     for (const [id, m] of this.markets) {
@@ -81,6 +84,7 @@ export class PaperExchange extends EventEmitter {
           if (this.dataSource !== 'real') { // upgrade only: never re-number live market ids
             this._setMarkets(list);
             this.dataSource = 'real';
+            this.candleDataSource = 'connecting';
           }
           break;
         }
@@ -147,10 +151,14 @@ export class PaperExchange extends EventEmitter {
           const data = (Array.isArray(j) ? j : []).map((c) => ({
             time: Number(c.t ?? c.T), open: +c.o, high: +c.h, low: +c.l, close: +c.c, volume: +(c.v ?? 0),
           })).filter((c) => Number.isFinite(c.close)).sort((a, b) => a.time - b.time);
-          if (data.length >= 20) return data;
+          if (data.length) {
+            this.candleDataSource = 'real';
+            return data;
+          }
         }
       } catch { /* fall through */ }
     }
+    this.candleDataSource = 'synthetic';
     return synthCandles(this.prices.get(Number(marketId)) || 100, n);
   }
 

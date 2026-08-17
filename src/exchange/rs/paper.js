@@ -25,6 +25,7 @@ export class PaperExchange extends EventEmitter {
     ]))];
     this.apiUrl = this.candidates[0];
     this.dataSource = 'connecting';   // 'real' | 'synthetic'
+    this.candleDataSource = 'connecting'; // K 线数据源独立于实时价格数据源
     this.network = null;              // 'mainnet' | 'testnet' | null
     this.tickMs = opts.tickMs ?? 1000;
     this.pollMs = opts.pollMs ?? 5000;
@@ -52,10 +53,12 @@ export class PaperExchange extends EventEmitter {
     if (chosen) {
       this.apiUrl = chosen;
       this.dataSource = 'real';
+      this.candleDataSource = 'connecting';
       this.network = chosen.includes('testnet') ? 'testnet' : 'mainnet';
     } else {
       console.log('[模拟模式] RISEx 行情接口不可达，使用合成行情。可设 RISEX_API_URL=https://api.rise.trade 或配置代理后重连。');
       this.dataSource = 'synthetic';
+      this.candleDataSource = 'synthetic';
       this._setMarkets(FALLBACK_MARKETS.map((m) => ({ ...m })));
     }
     for (const [id, m] of this.markets) {
@@ -77,6 +80,7 @@ export class PaperExchange extends EventEmitter {
           if (this.dataSource !== 'real') { // upgrade only: never re-number live market ids
             this._setMarkets(list);
             this.dataSource = 'real';
+            this.candleDataSource = 'connecting';
             // synthetic 启动时不会开 poll 定时器；升到 real 后必须清掉再走 _startLoops
             if (this._pollTimer) { clearInterval(this._pollTimer); this._pollTimer = null; }
             console.log(`[RISEx paper] 已切到真实行情: ${url}（${list.length} 个市场）`);
@@ -137,13 +141,24 @@ export class PaperExchange extends EventEmitter {
         const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
         if (res.ok) {
           const j = await res.json();
-          const data = (j.data || []).map((d) => ({
+          // Mainnet returns { data: { data: [...] } }; tolerate the flat
+          // shape as well so a valid real response never falls through to
+          // the synthetic random walk.
+          const rows = Array.isArray(j?.data) ? j.data
+            : Array.isArray(j?.data?.data) ? j.data.data
+            : Array.isArray(j?.candles) ? j.candles : [];
+          const data = rows.map((d) => ({
             time: Number(d.time) / 1e6, open: +d.open, high: +d.high, low: +d.low, close: +d.close, volume: +d.volume,
-          })).filter((c) => Number.isFinite(c.close));
-          if (data.length >= 20) return data;
+          })).filter((c) => Number.isFinite(c.time) && Number.isFinite(c.open)
+            && Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close));
+          if (data.length) {
+            this.candleDataSource = 'real';
+            return data;
+          }
         }
       } catch { /* fall through */ }
     }
+    this.candleDataSource = 'synthetic';
     return synthCandles(this.prices.get(marketId) || 100, n);
   }
 

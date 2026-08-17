@@ -4,6 +4,7 @@
 
 - 2026-08-13：完成重新部署持久化、安全续跑闸门及交易动作 crash-window 修复；`npm test`、全部改动 JS 的 Node 语法检查、`git diff --check`、生产依赖 dry-run、`npm ls --depth=0` 与 RISEx 动态 import 验证通过。三路独立终审均批准固定候选。Docker 镜像未能在本机构建，因 Docker daemon 不可用。
 - 2026-08-17：新增 `compose.yaml` 固定命名卷 `grid-bot-data`，`docker compose up -d --build` 自动创建并复用 `/app/data`，减少重新部署时的手动卷配置。
+- 2026-08-17：修复 RISEx paper K 线接口的嵌套响应解析（`{data:{data:[]}}`），增加独立 K 线来源标识；本地 Compose 实测 RISEx K 线为真实成交量，Decibel 因未配置 API Key 明确保持 synthetic。
 
 ## 当前任务
 

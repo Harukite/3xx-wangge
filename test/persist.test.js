@@ -310,6 +310,34 @@ class ResumeExchange extends EventEmitter {
 }
 
 {
+  const exchange = new RsPaperExchange({ apiUrl: 'https://risex.test' });
+  exchange.dataSource = 'real';
+  exchange.prices.set(1, 60000);
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    async json() {
+      return {
+        data: { data: [
+          { time: '1700000000000000000', open: '60000', high: '60100', low: '59900', close: '60050', volume: '12.5' },
+          { time: '1700003600000000000', open: '60050', high: '60200', low: '60000', close: '60150', volume: '18.75' },
+        ] },
+      };
+    },
+  });
+  try {
+    const candles = await exchange.getCandles(1, 3600, 200);
+    assert.equal(candles.length, 2, 'RISEx paper 必须解析真实接口的 data.data K 线，而不是静默回退 200 根合成数据');
+    assert.deepEqual(candles[0], {
+      time: 1700000000000, open: 60000, high: 60100, low: 59900, close: 60050, volume: 12.5,
+    });
+  } finally {
+    global.fetch = originalFetch;
+  }
+  console.log('  ✓ RISEx paper parses nested real candlestick responses');
+}
+
+{
   const exchange = new DecibelExchange({
     apiKey: 'test', privateKey: '1', subaccount: '0x1',
     cancelConfirmDelayMs: 0, cancelConfirmAttempts: 4,

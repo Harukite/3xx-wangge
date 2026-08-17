@@ -1224,6 +1224,13 @@ function makeExchangeCtrl(prefix, chartId) {
       curTrend = j.analysis;
       renderTrend(j.analysis);
       drawChart(j.candles || []);
+      const candleSource = j.candleDataSource || j.dataSource;
+      if (candleSource !== 'real') {
+        const note = candleSource === 'synthetic'
+          ? 'K线来源：合成数据（不是交易所真实 K 线）。请检查行情接口或 API Key。'
+          : 'K线来源：正在确认，暂不可证明为交易所真实 K 线。';
+        P('rec-detail').textContent = `${P('rec-detail').textContent} ${note}`;
+      }
       if (!P('lower').value) applyAutoRange();
     } catch (e) {
       P('rec-tag').textContent = '趋势数据暂不可用';

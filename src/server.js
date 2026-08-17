@@ -252,6 +252,7 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
         exchange: name,
         mode: exCfg.mode,
         dataSource: exchange.dataSource || (exCfg.mode === 'live' ? 'real' : 'synthetic'),
+        candleDataSource: exchange.candleDataSource || exchange.dataSource || (exCfg.mode === 'live' ? 'real' : 'synthetic'),
         network: exchange.network || exCfg.network,
         apiUrl: exchange.apiUrl || exCfg.apiUrl,
         markets: await exchange.getMarkets(),
@@ -271,7 +272,12 @@ function makeExchangeHandler(prefix, bot, exchange, exCfg, clients, name) {
             trend: 'range', recommended: 'neutral', strength: 0, atrPct: null, price,
             detail: '暂时拿不到足够K线数据，已默认中性网格。可手动设置上下边界后启动；不影响下单。',
           };
-      return send(res, 200, { analysis, candles: (candles || []).slice(-120) });
+      return send(res, 200, {
+        analysis,
+        candles: (candles || []).slice(-120),
+        dataSource: exchange.dataSource || (exCfg.mode === 'live' ? 'real' : 'synthetic'),
+        candleDataSource: exchange.candleDataSource || exchange.dataSource || (exCfg.mode === 'live' ? 'real' : 'synthetic'),
+      });
     }
 
     if (subPath === '/state') return send(res, 200, bot.getState());
